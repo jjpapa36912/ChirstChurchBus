@@ -2408,6 +2408,14 @@ struct BusTrack {
 // MARK: - ViewModel
 @MainActor
 final class MapVM: ObservableObject {
+    // MapVM.swift (프로퍼티)
+    private var autoRefreshTask: Task<Void, Never>?
+    private var focusETATask: Task<Void, Never>?
+
+    private(set) var isRefreshing = false
+    private var lastRefreshAt: Date = .distantPast
+    private let minRefreshInterval: TimeInterval = 5   // ← 5초로 확정
+
     // MapVM.swift (focusStop이 바뀔 때 자동 재시작)
     @Published var focusStop: BusStop? {
         didSet { restartFocusETAAutoRefresh() }
@@ -2417,19 +2425,19 @@ final class MapVM: ObservableObject {
     private func restartFocusETAAutoRefresh() {
         focusETATask?.cancel()
         guard focusStop != nil else { return }
-
         focusETATask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
                 await self.refreshFocusStopETA()
-                try? await Task.sleep(nanoseconds: 15 * 1_000_000_000) // 15초마다
+                try? await Task.sleep(nanoseconds: 15 * 1_000_000_000)
             }
         }
     }
 
+
     // MapVM.swift (프로퍼티 영역)
-    private var autoRefreshTask: Task<Void, Never>? = nil
-    private var focusETATask: Task<Void, Never>? = nil
+//    private var autoRefreshTask: Task<Void, Never>? = nil
+//    private var focusETATask: Task<Void, Never>? = nil
 
     /// 버스 위치 새로고침 주기(초)
     @Published var refreshIntervalSec: Int = 5
@@ -2481,7 +2489,7 @@ final class MapVM: ObservableObject {
     private var regionTask: Task<Void, Never>?
     private var autoTask: Task<Void, Never>?
     private var latestTopArrivals: [ArrivalInfo] = []
-    private var isRefreshing = false
+//    private var isRefreshing = false
 //    static let shared = MapVM()   // ✅ 싱글톤 접근 (AppDelegate에서 호출할 수 있도록)
 
 //       func stopById(_ id: String) -> BusStop? {
@@ -4209,47 +4217,50 @@ final class MapVM: ObservableObject {
                 // MapVM.reload(center:) 내부 switch provider
                 // MapVM.reload(center:) 내부 switch provider
 
-            case .christchurch:
-                do {
-                    // ① 근처 정류장(번들)
-                    let near = api.chc_nearbyStopsFromBundle(center: center, radiusMeters: 800)
-                    applyIfCurrent(epoch: epoch) {
-                        self.stops = near
-                        self.integrateKnownStops(near)
-                    }
-                    print("ℹ️ [CHC Reload] stops=\(near.count) center=(\(center.latitude),\(center.longitude))")
-
-                    // ② 차량 위치(Protobuf)
-                    let veh = try await api.chc_fetchVehiclePositions()
-                    print("🛰️ [CHC Vehicles] raw=\(veh.count) sample=\(veh.prefix(3))")
-
-                    // ⚠️ 1차: 필터 우회(그대로 지도에 뿌려 보기)
-                    if !veh.isEmpty {
+                // ----------------------------
+                // 🇳🇿 Christchurch
+                // ----------------------------
+                case .christchurch:
+                    do {
+                        // ① 근처 정류장(번들 캐시로 즉시 표시)
+                        let near = api.chc_nearbyStopsFromBundle(center: center, radiusMeters: 800)
                         applyIfCurrent(epoch: epoch) {
-                            self.buses = veh.map { v in
-                                var m = v
-                                // 좌표 sanity check (0,0 방지)
-                                if abs(m.lat) < 0.0001 && abs(m.lon) < 0.0001 {
-                                    m.lat = center.latitude
-                                    m.lon = center.longitude
-                                }
-                                return m
-                            }
-                            self.latestTopArrivals = []
+                            self.stops = near
+                            self.integrateKnownStops(near)
                         }
-                        print("✅ [CHC] set buses=\(veh.count) (no filter)")
-                    } else {
-                        // 비었으면 일단 비우고 리턴
-                        applyIfCurrent(epoch: epoch) { self.buses = []; self.latestTopArrivals = [] }
-                        print("⚠️ [CHC] vehicles empty")
+                        print("ℹ️ [CHC Reload] stops=\(near.count) center=(\(center.latitude),\(center.longitude))")
+
+                        // ② 차량 위치(Protobuf → BusLive)
+                        let veh = try await api.chc_fetchVehiclePositions()
+                        print("🛰️ [CHC Vehicles] raw=\(veh.count)")
+
+                        // ③ 스냅샷/필터(경로 사영·점프 억제·ETA 추정 포함)
+                        let snap = makeRouteSnapshot()
+                        let filtered = self.mergeAndFilter(veh, snap: snap)
+                        print("🧩 [CHC Vehicles] filtered=\(filtered.count)")
+
+                        // (선택) routeNoById 갱신: 팔로우/라벨링에 필요하면 유지
+                        for b in filtered { self.routeNoById[b.id] = b.routeNo }
+
+                        // ④ 상태 반영 (초기부터 filtered 사용 → 트랙/ID 일관 유지)
+                        applyIfCurrent(epoch: epoch) {
+                            self.buses = filtered
+                            self.latestTopArrivals = []   // ETA 패널은 정류장 탭 시 갱신
+                        }
+                        print("✅ [CHC] set buses=\(filtered.count)")
+
+                    } catch {
+                        print("❌ [CHC Reload] error: \(error)")
+                        applyIfCurrent(epoch: epoch) {
+                            self.latestTopArrivals = []
+                            self.buses = []
+                        }
                     }
 
-                } catch {
-                    print("❌ [CHC Reload] error: \(error)")
-                    applyIfCurrent(epoch: epoch) { self.buses = []; self.latestTopArrivals = [] }
-                }
-                startAutoRefresh()
-                return
+                    // ⑤ 자동 리프레시 시작 (아이콘 움직이도록)
+                    startAutoRefresh()
+                    return
+
 
 
 
@@ -4392,13 +4403,12 @@ final class MapVM: ObservableObject {
     // MapVM.swift
     @MainActor
     func startAutoRefresh() {
-        // 중복 방지
         autoRefreshTask?.cancel()
         autoRefreshTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
                 await self.refreshBusesOnly()
-                try? await Task.sleep(nanoseconds: UInt64(max(1, self.refreshIntervalSec)) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
             }
         }
     }
@@ -4408,9 +4418,10 @@ final class MapVM: ObservableObject {
         autoRefreshTask?.cancel()
         autoRefreshTask = nil
     }
+
     
-    private var lastRefreshAt: Date = .distantPast
-    private let minRefreshInterval: TimeInterval = 0.5
+//    private var lastRefreshAt: Date = .distantPast
+//    private let minRefreshInterval: TimeInterval = 0.5
     // MapVM
     @MainActor
     private func refreshBusesOnly() async {
@@ -4424,13 +4435,12 @@ final class MapVM: ObservableObject {
         epochCounter &+= 1
         let epoch = epochCounter
 
-        // 기존 상위 노선(ETA 기반) – 일부 지역에서 사용
+        // 기존 상위 노선(ETA 기반)
         var top = computeTopArrivals(
             allArrivals: latestTopArrivals,
             followedRouteNo: (followBusId.flatMap { routeNoById[$0] })
         )
 
-        // 팔로우 중이면 해당 노선 강제 포함(ETA 비었어도 최소 유지)
         if let fid = followBusId,
            let rno = routeNoById[fid],
            let rid = resolveRouteId(for: rno),
@@ -4439,30 +4449,27 @@ final class MapVM: ObservableObject {
         }
 
         // ── 지역별 분기 ───────────────────────────────────────────
-        switch provider {
-
-        // 🇳🇿 Christchurch — GTFS-RT(Protobuf) 전 차량 주기 갱신
-        case .christchurch:
+        if provider == .christchurch {
             do {
-                // 1) 차량 위치 가져오기 (Protobuf → BusLive)
+                // 1) 차량 가져오기 (GTFS-RT)
                 let vehicles = try await api.chc_fetchVehiclePositions()
 
-                // 2) 스냅샷/필터 (아이콘 품질/중복 제거)
+                // 2) 스냅/필터
                 let snap = makeRouteSnapshot()
                 let filtered = self.mergeAndFilter(vehicles, snap: snap)
 
-                // 3) 상태 머지 & follow 유령 유지
-                var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
+                // 3) 머지 & 유령 팔로우 유지
+                var mergedById = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
                 for b in filtered {
                     self.routeNoById[b.id] = b.routeNo
                     mergedById[b.id] = b
                 }
                 self.ensureFollowGhost(&mergedById)
 
-                applyIfCurrent(epoch: epoch) {
-                    self.buses = Array(mergedById.values)
-                }
-                // 4) 팔로우 대상 재획득
+                // 4) ⛳️ 여기선 applyIfCurrent 안 씀 (레이스 방지)
+                self.buses = Array(mergedById.values)
+
+                // 5) 팔로우 대상 재획득
                 if let fid = followBusId,
                    self.buses.first(where: { $0.id == fid }) == nil,
                    let rno = routeNoById[fid] {
@@ -4472,95 +4479,83 @@ final class MapVM: ObservableObject {
                         .min { lhs, rhs in
                             let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
                             let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
-                            let last = tracks[fid]?.lastLoc
-                            guard let last else { return false }
+                            guard let last = tracks[fid]?.lastLoc else { return false }
                             let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
                             return la.distance(from: a) < la.distance(from: b)
                         }
                     if let c = cand { followBusId = c.id }
                 }
             } catch {
-                // 조용히 실패 (네 기존 스타일 유지)
+                // 무음
             }
             return
+        }
 
-        // 🇳🇿 Wellington — 기존 전 차량 일괄 + 스냅/머지
-        case .wellington:
+        // 🇳🇿 Wellington (기존)
+        if provider == .wellington {
             do {
                 let vehicles = try await api.wl_fetchVehiclePositions()
-                var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
+                var mergedById = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
                 let snap = makeRouteSnapshot()
                 let filtered = self.mergeAndFilter(vehicles, snap: snap)
                 for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
                 self.ensureFollowGhost(&mergedById)
-                applyIfCurrent(epoch: epoch) { self.buses = Array(mergedById.values) }
+                self.buses = Array(mergedById.values)
 
-                // 팔로우 대상 재획득
                 if let fid = followBusId,
                    self.buses.first(where: { $0.id == fid }) == nil,
                    let rno = routeNoById[fid] {
-
                     let cand = self.buses
                         .filter { $0.routeNo == rno }
                         .min { lhs, rhs in
                             let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
                             let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
-                            let last = tracks[fid]?.lastLoc
-                            guard let last else { return false }
+                            guard let last = tracks[fid]?.lastLoc else { return false }
                             let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
                             return la.distance(from: a) < la.distance(from: b)
                         }
                     if let c = cand { followBusId = c.id }
                 }
-            } catch {
-                // 무음
-            }
+            } catch { }
             return
+        }
 
-        // 🇰🇷/🇳🇿 Auckland 등 기존 경로
-        default:
-            // 상위 ETA 비었으면 갱신 건너뜀
-            guard !top.isEmpty else { return }
+        // 🇰🇷/기타 (기존)
+        guard !top.isEmpty else { return }
 
-            let snap = makeRouteSnapshot()
-            let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
-            var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
+        let snap = makeRouteSnapshot()
+        let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+        var mergedById = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
 
-            do {
-                try await withThrowingTaskGroup(of: [BusLive].self) { group in
-                    for a in top {
-                        group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) }
-                    }
-                    while let arr = try await group.next() {
-                        let enriched = arr.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
-                        let filtered = self.mergeAndFilter(enriched, snap: snap)
-                        for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
-                        self.ensureFollowGhost(&mergedById)
-                        applyIfCurrent(epoch: epoch) { self.buses = Array(mergedById.values) }
-                    }
+        do {
+            try await withThrowingTaskGroup(of: [BusLive].self) { group in
+                for a in top {
+                    group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) }
                 }
-            } catch {
-                // 무음
+                while let arr = try await group.next() {
+                    let enriched = arr.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
+                    let filtered = self.mergeAndFilter(enriched, snap: snap)
+                    for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
+                    self.ensureFollowGhost(&mergedById)
+                    self.buses = Array(mergedById.values)
+                }
             }
+        } catch { }
 
-            // 팔로우 대상 재획득
-            if let fid = followBusId,
-               self.buses.first(where: { $0.id == fid }) == nil,
-               let rno = routeNoById[fid] {
+        if let fid = followBusId,
+           self.buses.first(where: { $0.id == fid }) == nil,
+           let rno = routeNoById[fid] {
 
-                let cand = self.buses
-                    .filter { $0.routeNo == rno }
-                    .min { lhs, rhs in
-                        let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
-                        let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
-                        let last = tracks[fid]?.lastLoc
-                        guard let last else { return false }
-                        let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
-                        return la.distance(from: a) < la.distance(from: b)
-                    }
-                if let c = cand { followBusId = c.id }
-            }
-            return
+            let cand = self.buses
+                .filter { $0.routeNo == rno }
+                .min { lhs, rhs in
+                    let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
+                    let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
+                    guard let last = tracks[fid]?.lastLoc else { return false }
+                    let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
+                    return la.distance(from: a) < la.distance(from: b)
+                }
+            if let c = cand { followBusId = c.id }
         }
     }
 
@@ -4655,9 +4650,9 @@ final class MapVM: ObservableObject {
             let now = Date()
             let nowC = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
 
-            // Wellington에서는 rid=routeNo 사용(메타가 없어도 버스는 보여야 함)
+            // 🔧 변경: CHC도 routeNo를 rid로 사용 (WL과 동일 정책)
             let rid: String
-            if provider == .wellington {
+            if provider == .wellington || provider == .christchurch {
                 rid = b.routeNo
             } else {
                 guard let r = resolveRouteId(for: b.routeNo) else { continue }
@@ -4767,13 +4762,12 @@ final class MapVM: ObservableObject {
                 }
             }
 
-            // 4') ⬇️ 메타 없음/사영 실패/횡오차 큼 → coast + 방향기반 폴백으로 **다음 정류장/ETA 채움**
+            // 4') 메타 없음/사영 실패 → coast + 방향기반 폴백
             let pred = tr.coastPredict(at: now.addingTimeInterval(0.6),
                                        decay: COAST_DECAY_PER_SEC, minSpeed: COAST_MIN_SPEED)
             bus.lat = pred.latitude
             bus.lon = pred.longitude
 
-            // ▶ 방향기반 후보 + ETA 계산 (기존 ensureFollowGhost에서만 하던 걸 여기서도 수행)
             let (ns, etaRaw) = nextStopAndETA(busId: bus.id, coord: pred, track: tr, fallbackByName: bus.nextStopName)
             if let s = ns { bus.nextStopName = s.name }
             let dist = ns.map { s in
