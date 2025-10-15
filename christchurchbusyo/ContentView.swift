@@ -2160,8 +2160,9 @@ final class BusAnnotation: NSObject, MKAnnotation {
     private(set) var etaMinutes: Int?
     @objc dynamic var title: String?
     @objc dynamic var subtitle: String?
-
-    // ✅ MapKit KVO용: dynamic만, will/didChange 직접 호출 금지
+    // 맵에 실제로 올라가 있는지(추가 직후 true, 제거 직전 false)
+        @objc dynamic private(set) var isOnMap: Bool = false
+        func setOnMap(_ v: Bool) { isOnMap = v }    // ✅ MapKit KVO용: dynamic만, will/didChange 직접 호출 금지
     @objc dynamic var coordinate: CLLocationCoordinate2D
 //    var title: String? { routeNo }
 
@@ -2213,51 +2214,23 @@ final class BusAnnotation: NSObject, MKAnnotation {
        private var applyScheduled = false
     
     // ⬇️ 여기 교체
-    // ✅ 좌표 갱신(안전판 + 합치기)
-       func applyModelOnly(_ newLive: BusLive) {
-           if !Thread.isMainThread {
-               DispatchQueue.main.async { [weak self] in self?.applyModelOnly(newLive) }
-               return
-           }
-           // 제거 예정이면 좌표 갱신 금지
-           if isZombie { return }
-
-           // 최신값만 보관
-           pendingLive = newLive
-           if applyScheduled { return }
-           applyScheduled = true
-
-           // 현재 사이클 종료 후 한 번만 적용
-           RunLoop.main.perform(inModes: [.common]) { [weak self] in
-               guard let self, let live = self.pendingLive, !self.isZombie else {
-                   self?.applyScheduled = false
-                   return
-               }
-               self.pendingLive = nil
-               self.applyScheduled = false
-
-               // 너무 미세한 이동은 무시(노이즈 억제)
-               let last = CLLocation(latitude: self.coordinate.latitude, longitude: self.coordinate.longitude)
-               let next = CLLocation(latitude: live.lat, longitude: live.lon)
-               if last.distance(from: next) < 0.4 {
-                   // 라벨만 갱신
-                   self.title = live.routeNo
-                   self.subtitle = Self.makeSubtitle(eta: live.etaMinutes, next: live.nextStopName)
-                   return
-               }
-
-               // 🔒 MapKit 내부 열거/애니메이션과 충돌 최소화
-               UIView.performWithoutAnimation {
-                   CATransaction.begin()
-                   CATransaction.setDisableActions(true)
-                   // ⚠️ will/didChange 생략: KVO는 set 자체로 충분, 중첩 이벤트 줄임
-                   self.coordinate = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
-                   self.title = live.routeNo
-                   self.subtitle = Self.makeSubtitle(eta: live.etaMinutes, next: live.nextStopName)
-                   CATransaction.commit()
-               }
-           }
-       }
+    // 좌표/라벨만 업데이트 (KVO 충돌 방지용)
+        func applyModelOnly(_ newLive: BusLive) {
+            // 제거 중/맵에서 내려간 상태면 갱신 금지
+            if isZombie || !isOnMap { return }
+            // 반드시 메인 + 트랜잭션 1회
+            if !Thread.isMainThread {
+                DispatchQueue.main.async { [weak self] in self?.applyModelOnly(newLive) }
+                return
+            }
+            // MapKit 내부 애니메이션/열거와 충돌 줄이기: 암시적 애니메이션 끄고 한 번에 반영
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.coordinate = .init(latitude: newLive.lat, longitude: newLive.lon)
+            self.title = newLive.routeNo
+            self.subtitle = Self.makeSubtitle(eta: newLive.etaMinutes, next: newLive.nextStopName)
+            CATransaction.commit()
+        }
     
     // ✅ 전체 업데이트(애니메이션 포함): will/did 없이 coordinate 직접 대입
     @MainActor
@@ -5398,151 +5371,105 @@ struct ClusteredMapView: UIViewRepresentable {
         // ClusteredMapView.Coord 내부 메서드 교체
         // ClusteredMapView.Coord
         // ClusteredMapView.Coord 내부
+        // ClusteredMapView.Coord 내부 메서드 교체
+        private let annotationWorkQueue = DispatchQueue(label: "map.annotation.queue", qos: .userInteractive)
+
         func applyAnnotationDiff(
             on mapView: MKMapView,
             stopsToAdd: [MKAnnotation],
             stopsToRemove: [MKAnnotation],
             busesToAdd: [MKAnnotation],
-            busesToRemove: [MKAnnotation],              // ← 들어오지만 실제로 제거하지 않음
+            busesToRemove: [MKAnnotation],
             busUpdates: [(BusAnnotation, BusLive)]
         ) {
-            // 중복 실행 가드
+            // 재진입 가드
             if isApplyingDiff { return }
             isApplyingDiff = true
 
-            // 배치 유틸 (정류장 제거/추가 전용)
-            func removeAnnotationsInBatches(
-                _ mapView: MKMapView,
-                annotations: [MKAnnotation],
-                batchSize: Int = 200,
-                completion: @escaping () -> Void
-            ) {
-                guard !annotations.isEmpty else { completion(); return }
-                var index = 0
-                func step() {
-                    if index >= annotations.count { completion(); return }
-                    let end   = min(index + batchSize, annotations.count)
-                    let chunk = Array(annotations[index..<end])
-                    UIView.performWithoutAnimation {
-                        CATransaction.begin()
-                        CATransaction.setDisableActions(true)
-                        mapView.removeAnnotations(chunk)
-                        CATransaction.commit()
-                    }
-                    index = end
-                    DispatchQueue.main.async { step() }
+            annotationWorkQueue.async { [weak self, weak mapView] in
+                guard let self, let mapView else { return }
+
+                // 0) 현재 맵에 있는지 스냅샷 (메인 필요)
+                var present = Set<ObjectIdentifier>()
+                DispatchQueue.main.sync {
+                    present = Set(mapView.annotations.map { ObjectIdentifier($0) })
                 }
-                step()
-            }
 
-            func addAnnotationsInBatches(
-                _ mapView: MKMapView,
-                annotations: [MKAnnotation],
-                batchSize: Int = 200,
-                completion: @escaping () -> Void
-            ) {
-                guard !annotations.isEmpty else { completion(); return }
-                var index = 0
-                func step() {
-                    if index >= annotations.count { completion(); return }
-                    let end   = min(index + batchSize, annotations.count)
-                    let chunk = Array(annotations[index..<end])
-                    UIView.performWithoutAnimation {
-                        CATransaction.begin()
-                        CATransaction.setDisableActions(true)
-                        mapView.addAnnotations(chunk)
-                        CATransaction.commit()
+                // 업데이트 대상 ID 모음
+                let updatingBusIds = Set(busUpdates.map { $0.0.id })
+                let followedId = self.parent.vm.followBusId
+
+                // 실제 맵에 있는 것만 제거 후보로, 팔로우/선택/업데이트 중은 제외
+                let selectedIds: Set<String> = {
+                    var s = Set<String>()
+                    DispatchQueue.main.sync {
+                        s = Set(mapView.selectedAnnotations.compactMap { ($0 as? BusAnnotation)?.id })
                     }
-                    index = end
-                    DispatchQueue.main.async { step() }
-                }
-                step()
-            }
+                    return s
+                }()
 
-            // 1) add/remove 준비
-            DispatchQueue.main.async { [weak self, weak mapView] in
-                guard let self, let mapView else { self?.isApplyingDiff = false; return }
-
-                let present          = Set(mapView.annotations.map { ObjectIdentifier($0) })
-                let updatingBusIds   = Set(busUpdates.map { $0.0.id })
-                let followedId       = self.parent.vm.followBusId
-                let selectedIds      = Set(mapView.selectedAnnotations.compactMap { ($0 as? BusAnnotation)?.id })
-
-                // 실제 존재하는 정류장만 제거 후보
                 let safeStopsToRemove = stopsToRemove.filter { present.contains(ObjectIdentifier($0)) }
-
-                // 버스 제거는 하지 않는다(크래시 회피). 대신 좀비로 마킹
-                let toZombieBuses: [BusAnnotation] = busesToRemove.compactMap { a in
-                    guard let b = a as? BusAnnotation else { return nil }
-                    // 팔로우/선택/업데이트 중이면 숨김 금지
-                    if let fid = followedId, fid == b.id { return nil }
-                    if selectedIds.contains(b.id)        { return nil }
-                    if updatingBusIds.contains(b.id)     { return nil }
+                let safeBusesToRemove: [MKAnnotation] = busesToRemove.compactMap { a in
+                    guard present.contains(ObjectIdentifier(a)) else { return nil }
+                    guard let b = a as? BusAnnotation else { return a }
+                    if followedId == b.id { return nil }
+                    if selectedIds.contains(b.id) { return nil }
+                    if updatingBusIds.contains(b.id) { return nil }
                     return b
                 }
 
-                // 정류장/버스 추가
-                let toAddStops = stopsToAdd
-                let toAddBuses = busesToAdd
-
-                // --- A. 정류장 제거(배치) ---
-                removeAnnotationsInBatches(mapView, annotations: safeStopsToRemove, batchSize: 200) { [weak self, weak mapView] in
-                    guard let self, let mapView else { self?.isApplyingDiff = false; return }
-
-                    // --- B. 정류장/버스 추가(배치) ---
-                    let toAddAll = toAddStops + toAddBuses
-                    addAnnotationsInBatches(mapView, annotations: toAddAll, batchSize: 200) { [weak self, weak mapView] in
-                        guard let self, let mapView else { self?.isApplyingDiff = false; return }
-
-                        // --- C. 일부 버스를 “좀비” 처리(뷰만 숨김; 실제 제거는 안 함) ---
-                        DispatchQueue.main.async {
-                            for b in toZombieBuses {
-                                if let v = mapView.view(for: b) as? BusMarkerView {
-                                    v.alpha = 0.0
-                                    v.isUserInteractionEnabled = false
-                                }
-                                b.markZombie()
-                            }
-                        }
-
-                        // --- D. 모델 업데이트(좌표/부제 등) — 다음 틱 ---
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self, weak mapView] in
-                            guard let self, let mapView else { self?.isApplyingDiff = false; return }
-
-                            CATransaction.begin()
-                            CATransaction.setDisableActions(true)
-
-                            for (anno, live) in busUpdates {
-                                // 내부에서 main.async로 좌표를 다음 틱에 세팅하여 KVO/열거 경합 회피
-                                anno.applyModelOnly(live)
-                            }
-
-                            CATransaction.commit()
-
-                            // --- E. 뷰 후처리 — 또 한 박자 뒤 ---
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self, weak mapView] in
-                                guard let self, let mapView else { self?.isApplyingDiff = false; return }
-
-                                // UI 갱신
-                                for (anno, _) in busUpdates {
-                                    if let mv = mapView.view(for: anno) as? BusMarkerView {
-                                        mv.updateAlwaysOnBubble()
-                                        // 모델 갱신으로 되살아난 경우 좀비 해제
-                                        mv.alpha = 1.0
-                                        mv.isUserInteractionEnabled = true
-                                    }
-                                    anno.unmarkZombie()
-                                }
-
-                                // 배치 후 일괄 후처리
-                                self.updateFollowTints(mapView)
-                                self.recolorStops(mapView)
-                                self.safeDeconflictAll(mapView)
-
-                                self.isApplyingDiff = false
-                            }
+                // 1) 제거 전에 좀비 표시 + 맵 플래그 false
+                DispatchQueue.main.sync {
+                    (safeStopsToRemove + safeBusesToRemove).forEach { a in
+                        if let b = a as? BusAnnotation {
+                            b.markZombie()
+                            b.setOnMap(false)
                         }
                     }
+                }
+
+                // 2) 제거
+                DispatchQueue.main.sync {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    mapView.removeAnnotations(safeStopsToRemove + safeBusesToRemove)
+                    CATransaction.commit()
+                }
+
+                // 3) 추가
+                DispatchQueue.main.sync {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    mapView.addAnnotations(stopsToAdd + busesToAdd)
+                    // 추가된 버스는 onMap = true 로 전환
+                    busesToAdd.forEach { a in (a as? BusAnnotation)?.setOnMap(true) }
+                    CATransaction.commit()
+                }
+
+                // 4) 모델 업데이트 (좌표 KVO는 여기서만, 좀비/맵밖이면 skip)
+                DispatchQueue.main.sync {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    for (anno, live) in busUpdates {
+                        // 제거되었거나 내려간 상태는 자동 skip
+                        anno.applyModelOnly(live)
+                    }
+                    CATransaction.commit()
+                }
+
+                // 5) 뷰 후처리(버블/틴트/겹침해소)
+                DispatchQueue.main.sync { [weak self, weak mapView] in
+                    guard let self, let mapView else { return }
+                    for (anno, _) in busUpdates {
+                        if let mv = mapView.view(for: anno) as? BusMarkerView {
+                            mv.updateAlwaysOnBubble()
+                        }
+                    }
+                    self.updateFollowTints(mapView)
+                    self.recolorStops(mapView)
+                    self.safeDeconflictAll(mapView)
+
+                    self.isApplyingDiff = false
                 }
             }
         }
