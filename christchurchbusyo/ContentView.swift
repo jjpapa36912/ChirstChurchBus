@@ -507,40 +507,47 @@ final class BusAPI: NSObject, URLSessionDelegate {
            return arrivals
        }
 
+    // BusAPI.swift
     func chc_fetchVehiclePositions() async throws -> [BusLive] {
-           guard let url = URL(string: "https://apis.metroinfo.co.nz/rti/gtfsrt/v1/vehicle-positions.pb") else {
-               throw URLError(.badURL)
-           }
-           var req = URLRequest(url: url)
-           req.setValue(CHCAuth.subscriptionKey, forHTTPHeaderField: "Ocp-Apim-Subscription-Key")
+        guard let url = URL(string: "https://apis.metroinfo.co.nz/rti/gtfsrt/v1/vehicle-positions.pb") else {
+            throw URLError(.badURL)
+        }
+        var req = URLRequest(url: url)
+        req.setValue(CHCAuth.subscriptionKey, forHTTPHeaderField: "Ocp-Apim-Subscription-Key")
 
-           let (data, resp) = try await URLSession.shared.data(for: req)
-           let http = resp as! HTTPURLResponse
-           guard http.statusCode == 200, !data.isEmpty else {
-               print("❌ [CHC Vehicles] HTTP \(http.statusCode) bytes=\(data.count)")
-               return []
-           }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let http = resp as! HTTPURLResponse
+        guard http.statusCode == 200, !data.isEmpty else {
+            print("❌ [CHC Vehicles] HTTP \(http.statusCode) bytes=\(data.count)")
+            if data.count > 0, let body = String(data: data, encoding: .utf8) {
+                print("⚠️ [CHC Vehicles] body=\(body)")
+            }
+            return []
+        }
 
-           // TransitRealtime_FeedMessage 는 gtfs-realtime.proto 컴파일 산출 타입명 (환경에 따라 접두사 다를 수 있음)
-           let feed = try TransitRealtime_FeedMessage(serializedData: data)
+        let feed = try TransitRealtime_FeedMessage(serializedData: data)
 
-           var out: [BusLive] = []
-           out.reserveCapacity(feed.entity.count)
+        var out: [BusLive] = []
+        out.reserveCapacity(feed.entity.count)
 
         for ent in feed.entity {
-            let vp = ent.vehicle.position   // non-optional 값
+            let vp = ent.vehicle.position
             let lat = Double(vp.latitude)
             let lon = Double(vp.longitude)
 
+            // ✅ routeNo는 표시에 쓰고, id는 '차량 고유 id'만 사용 (팔로우 안정화)
             let route = ent.vehicle.trip.routeID.isEmpty
-                       ? (ent.vehicle.trip.tripID.isEmpty ? "?" : ent.vehicle.trip.tripID)
-                       : ent.vehicle.trip.routeID
+                      ? (ent.vehicle.trip.tripID.isEmpty ? "?" : ent.vehicle.trip.tripID)
+                      : ent.vehicle.trip.routeID
             let routeNo = route.split(separator: "-").first.map(String.init) ?? route
 
+            // ✅ 여기! entity.id 사용 금지. vehicle.vehicle.id 가 핵심
+            let stableVehicleId = ent.vehicle.vehicle.id.isEmpty
+                                ? (ent.id.isEmpty ? UUID().uuidString : ent.id)
+                                : ent.vehicle.vehicle.id
+
             out.append(BusLive(
-                id: ent.id.isEmpty
-                    ? (ent.vehicle.vehicle.id.isEmpty ? UUID().uuidString : ent.vehicle.vehicle.id)
-                    : ent.id,
+                id: stableVehicleId,              // ← 팔로우/머지의 기준은 '차량 id'로 고정
                 routeNo: routeNo.uppercased(),
                 lat: lat,
                 lon: lon,
@@ -549,10 +556,10 @@ final class BusAPI: NSObject, URLSessionDelegate {
             ))
         }
 
+        print("✅ [CHC Vehicles] decoded=\(out.count)")
+        return out
+    }
 
-           print("✅ [CHC Vehicles] decoded=\(out.count)")
-           return out
-       }
     /// Christchurch: 지도 중심 근처 정류장 검색 (JSON 포맷 변조 허용)
     // BusAPI.swift
     /// ❗️CHC에는 근처 정류장 geo-검색 엔드포인트가 없어 404가 정상입니다.
@@ -2161,27 +2168,26 @@ final class BusAnnotation: NSObject, MKAnnotation {
     // subtitle은 수동 KVO(다음 런루프)로 유지해도 OK (MapKit이 직접 관찰 안함)
     @objc dynamic private var subtitleStorage: String?
 //    var subtitle: String? { subtitleStorage }
-    var live: BusLive
-
+//    var live: BusLive
     init(bus: BusLive) {
             self.id = bus.id
             self.routeNo = bus.routeNo
             self.coordinate = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
-            self.title = bus.routeNo
-            self.subtitle = Self.makeSubtitle(eta: bus.etaMinutes, next: bus.nextStopName)
-            self.live = bus                    // 🔴 반드시 super.init() 이전에!
+            self.nextStopName = bus.nextStopName
+            self.etaMinutes   = bus.etaMinutes
+            self._title = bus.routeNo
+            self._subtitle = BusAnnotation.makeSubtitle(eta: bus.etaMinutes, next: bus.nextStopName)
             super.init()
         }
 
-
-    private static func makeSubtitle(eta: Int?, next: String?) -> String? {
-        switch (eta, next) {
-        case let (.some(e), .some(n)): return "next \(n) · about \(e)min"
-        case let (.none, .some(n)):    return "next \(n)"
-        case let (.some(e), .none):    return "next stop, about \(e)min"
-        default:                       return nil
+    private static func makeSubtitle(eta: Int?, next: String?) -> String {
+            switch (eta, next) {
+            case let (e?, n?) where !n.isEmpty: return "Next: \(n) · \(max(0,e))min"
+            case let (e?, nil):                 return "\(max(0,e))min"
+            case let (nil, n?):                 return "Next: \(n)"
+            default:                            return ""
+            }
         }
-    }
 
     // subtitle은 다음 런루프에서만 KVO 알림 (MapKit 내부 열거와 충돌 방지)
     private func setSubtitle(_ s: String?) {
@@ -2194,15 +2200,19 @@ final class BusAnnotation: NSObject, MKAnnotation {
     }
     private var pendingCoord: CLLocationCoordinate2D?
     private var coordScheduled = false
-  
+    private var _title: String?
+       private var _subtitle: String?    // ✅ 모델만 갱신 (뷰는 건드리지 않음)
+    func applyModelOnly(_ live: BusLive) {
+           // 좌표 KVO 반영 (MapKit 애니메이션/관측 안전)
+           willChangeValue(forKey: "coordinate")
+           coordinate = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
+           didChangeValue(forKey: "coordinate")
 
-    // ✅ “모델만” 업데이트: 수동 KVO 금지, 단순 프로퍼티 대입만!
-        func applyModelOnly(_ live: BusLive) {
-            // 메인에서만 호출된다는 가정(우리 diff 함수가 보장)
-            self.coordinate = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
-            self.title = live.routeNo
-            self.subtitle = Self.makeSubtitle(eta: live.etaMinutes, next: live.nextStopName)
-        }
+           nextStopName = live.nextStopName
+           etaMinutes   = live.etaMinutes
+           _subtitle = BusAnnotation.makeSubtitle(eta: live.etaMinutes, next: live.nextStopName)
+           _title = live.routeNo // routeNo 바뀔 수 있으나 id는 그대로 → 팔로우 유지
+       }
     // ✅ 전체 업데이트(애니메이션 포함): will/did 없이 coordinate 직접 대입
     @MainActor
     func update(to b: BusLive) {
@@ -4603,10 +4613,11 @@ final class MapVM: ObservableObject {
     // MapVM 안
     // MapVM 안
     // MapVM 안: 기존 mergeAndFilter(_ incoming:snap:) 통째로 교체
+    // MapVM 안
     private func mergeAndFilter(_ incoming: [BusLive], snap: RouteSnapshot) -> [BusLive] {
         var out: [BusLive] = []
 
-        // 튜닝(기존 값 유지)
+        // 튜닝 파라미터(기존 유지)
         let LATERAL_MAX_M: Double = 60
         let PASS_GATE_M: Double   = 18
         let SPEED_FLOOR_MPS: Double = 1.5
@@ -4620,22 +4631,18 @@ final class MapVM: ObservableObject {
             let now = Date()
             let nowC = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
 
-            // 👇👇 핵심: CHC는 차량 고유 ID만 사용 (routeNo 붙이지 않음)
-            // Wellington은 기존처럼 routeNo#vehId 사용
-            // 그 외(MOTIE 등)는 routeId 해석 후 routeId#vehId 사용
-            let cid: String
-            if provider == .christchurch {
-                // feed에서 오는 vehicle.id 는 세션 간에도 안정적
-                cid = b.id.isEmpty ? UUID().uuidString : b.id
-            } else if provider == .wellington {
-                let rid = b.routeNo
-                cid = compoundBusId(routeId: rid, rawVehId: b.id)
+            // ✅ CHC/WL 도중에도 'id'를 다시 만들지 말고, route meta 용 키만 따로 사용
+            let ridForMeta: String
+            if provider == .wellington || provider == .christchurch {
+                ridForMeta = b.routeNo                  // 메타 조회용 키
             } else {
                 guard let r = resolveRouteId(for: b.routeNo) else { continue }
-                cid = compoundBusId(routeId: r, rawVehId: b.id)
+                ridForMeta = r
             }
 
-            // 합성된 id로 BusLive 재작성
+            // ✅ 합성 금지: 들어온 id 그대로 씁니다.
+            let cid = b.id
+
             var bus = BusLive(
                 id: cid,
                 routeNo: b.routeNo,
@@ -4647,7 +4654,7 @@ final class MapVM: ObservableObject {
 
             let isFollowed = (followBusId == bus.id)
 
-            // 1) 트랙 보장
+            // 1) 트랙 초기화
             if tracks[bus.id] == nil {
                 tracks[bus.id] = BusTrack(prevLoc: nil, prevAt: nil, lastLoc: nowC, lastAt: now)
                 out.append(bus)
@@ -4655,7 +4662,7 @@ final class MapVM: ObservableObject {
             }
             var tr = tracks[bus.id]!
 
-            // 2) 점프/EMA 스무딩
+            // 2) 점프/EMA
             let step = CLLocation(latitude: tr.lastLoc.latitude, longitude: tr.lastLoc.longitude)
                 .distance(from: CLLocation(latitude: nowC.latitude, longitude: nowC.longitude))
             let dt = max(0.01, now.timeIntervalSince(tr.lastAt))
@@ -4682,14 +4689,12 @@ final class MapVM: ObservableObject {
             tr.updateKinematics()
             tracks[bus.id] = tr
 
-            // 3) 메타/사영 후 ETA & nextStop
-            if provider == .christchurch,
-               let meta = snap.metaById[bus.routeNo],   // CHC는 routeNo를 meta key로 사용
-               let rStops = snap.stopsByRouteId[bus.routeNo],
+            // 3) 메타/사영
+            if let meta = snap.metaById[ridForMeta],
+               let rStops = snap.stopsByRouteId[ridForMeta],
                let prj = projectOnRoute(smooth, shape: meta.shape, cumul: meta.cumul),
                prj.lateral <= LATERAL_MAX_M {
 
-                // 경로로 스냅
                 bus.lat = prj.snapped.latitude
                 bus.lon = prj.snapped.longitude
 
@@ -4722,7 +4727,6 @@ final class MapVM: ObservableObject {
 
                     maybeSnapToStop(&bus)
 
-                    // 팔로우 보조(트레일/미래경로/하이라이트)
                     if isFollowed {
                         let c = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
                         trail.appendIfNeeded(c); trailVersion &+= 1
@@ -4735,7 +4739,7 @@ final class MapVM: ObservableObject {
                 }
             }
 
-            // 3') 메타 없거나 사영 실패 → coast + 방향기반 폴백
+            // 4') 폴백
             let pred = tr.coastPredict(at: now.addingTimeInterval(0.6),
                                        decay: COAST_DECAY_PER_SEC, minSpeed: COAST_MIN_SPEED)
             bus.lat = pred.latitude
@@ -4743,9 +4747,7 @@ final class MapVM: ObservableObject {
 
             let (ns, etaRaw) = nextStopAndETA(busId: bus.id, coord: pred, track: tr, fallbackByName: bus.nextStopName)
             if let s = ns { bus.nextStopName = s.name }
-            let dist = ns.map { s in
-                GeoUtil.deltaMeters(from: pred, to: .init(latitude: s.lat, longitude: s.lon)).dist
-            }
+            let dist = ns.map { s in GeoUtil.deltaMeters(from: pred, to: .init(latitude: s.lat, longitude: s.lon)).dist }
             if let e = smoothETA(rawETA: etaRaw, busId: bus.id, distToNextStop: dist) {
                 bus.etaMinutes = e
                 lastETAMinByBusId[bus.id] = e
@@ -4762,6 +4764,7 @@ final class MapVM: ObservableObject {
 
         return out
     }
+
 
 
 
