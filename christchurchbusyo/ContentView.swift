@@ -2204,24 +2204,61 @@ final class BusAnnotation: NSObject, MKAnnotation {
        private var _subtitle: String?
     // ✅ 모델만 갱신 (뷰는 건드리지 않음)
     // 🔹 좀비(숨김) 상태
-        var isZombie: Bool = false
+    // ⬇️ 제거 예정일 때 true (제거 중 좌표갱신 금지)
+    @objc dynamic private(set) var isZombie: Bool = false
+       func markZombie()   { isZombie = true }
+       func unmarkZombie() { isZombie = false }
+    // ⬇️ 추가: 갱신 합치기(coalescing)용 버퍼
+       private var pendingLive: BusLive?
+       private var applyScheduled = false
     
-    
-    func applyModelOnly(_ newLive: BusLive) {
+    // ⬇️ 여기 교체
+    // ✅ 좌표 갱신(안전판 + 합치기)
+       func applyModelOnly(_ newLive: BusLive) {
            if !Thread.isMainThread {
                DispatchQueue.main.async { [weak self] in self?.applyModelOnly(newLive) }
                return
            }
-           // 다음 런루프 틱에 좌표를 바꿔 MapKit 내부 열거와 충돌 회피
-           DispatchQueue.main.async { [weak self] in
-               guard let self else { return }
-//               self.live = newLive
-               self.coordinate = CLLocationCoordinate2D(latitude: newLive.lat, longitude: newLive.lon)
-               self.title = newLive.routeNo
-               self.subtitle = Self.makeSubtitle(eta: newLive.etaMinutes, next: newLive.nextStopName)
-               if self.isZombie { self.isZombie = false }
+           // 제거 예정이면 좌표 갱신 금지
+           if isZombie { return }
+
+           // 최신값만 보관
+           pendingLive = newLive
+           if applyScheduled { return }
+           applyScheduled = true
+
+           // 현재 사이클 종료 후 한 번만 적용
+           RunLoop.main.perform(inModes: [.common]) { [weak self] in
+               guard let self, let live = self.pendingLive, !self.isZombie else {
+                   self?.applyScheduled = false
+                   return
+               }
+               self.pendingLive = nil
+               self.applyScheduled = false
+
+               // 너무 미세한 이동은 무시(노이즈 억제)
+               let last = CLLocation(latitude: self.coordinate.latitude, longitude: self.coordinate.longitude)
+               let next = CLLocation(latitude: live.lat, longitude: live.lon)
+               if last.distance(from: next) < 0.4 {
+                   // 라벨만 갱신
+                   self.title = live.routeNo
+                   self.subtitle = Self.makeSubtitle(eta: live.etaMinutes, next: live.nextStopName)
+                   return
+               }
+
+               // 🔒 MapKit 내부 열거/애니메이션과 충돌 최소화
+               UIView.performWithoutAnimation {
+                   CATransaction.begin()
+                   CATransaction.setDisableActions(true)
+                   // ⚠️ will/didChange 생략: KVO는 set 자체로 충분, 중첩 이벤트 줄임
+                   self.coordinate = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
+                   self.title = live.routeNo
+                   self.subtitle = Self.makeSubtitle(eta: live.etaMinutes, next: live.nextStopName)
+                   CATransaction.commit()
+               }
            }
        }
+    
     // ✅ 전체 업데이트(애니메이션 포함): will/did 없이 coordinate 직접 대입
     @MainActor
     func update(to b: BusLive) {
@@ -5314,6 +5351,48 @@ struct ClusteredMapView: UIViewRepresentable {
             step()
         }
 
+        
+        // ClusteredMapView.Coord 내부 어디든 private helper로 추가
+        private func hydrateVisibleBusAnnotations(_ mapView: MKMapView) {
+            // 현재 보이는 맵 영역
+            let visible = mapView.visibleMapRect
+
+            // 이미 올라가 있는 버스 어노테이션 id 집합
+            let existingIds: Set<String> = Set(
+                mapView.annotations.compactMap { ($0 as? BusAnnotation)?.id }
+            )
+
+            // 현재 VM이 들고 있는 전체 버스 중,
+            // "화면 안" + "아직 어노테이션이 없는" 것만 골라서 추가
+            var toAdd: [BusAnnotation] = []
+            toAdd.reserveCapacity(64)
+
+            for b in parent.vm.buses {
+                let id = b.id
+                if existingIds.contains(id) { continue }
+                let coord = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
+                let pt = MKMapPoint(coord)
+                if visible.contains(pt) {
+                    toAdd.append(BusAnnotation(bus: b))
+                }
+            }
+
+            guard !toAdd.isEmpty else { return }
+
+            UIView.performWithoutAnimation {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                mapView.addAnnotations(toAdd)
+                CATransaction.commit()
+            }
+
+            // 디버그 로그 (원하면 주석)
+            print("🧩 [Hydrate] added \(toAdd.count) buses for current viewport")
+        }
+
+        
+        
+        
 
         // ClusteredMapView.Coord 내부 통째 교체
         // ClusteredMapView.Coord 내부 메서드 교체
@@ -5422,7 +5501,7 @@ struct ClusteredMapView: UIViewRepresentable {
                                     v.alpha = 0.0
                                     v.isUserInteractionEnabled = false
                                 }
-                                b.isZombie = true
+                                b.markZombie()
                             }
                         }
 
@@ -5452,7 +5531,7 @@ struct ClusteredMapView: UIViewRepresentable {
                                         mv.alpha = 1.0
                                         mv.isUserInteractionEnabled = true
                                     }
-                                    anno.isZombie = false
+                                    anno.unmarkZombie()
                                 }
 
                                 // 배치 후 일괄 후처리
@@ -5774,10 +5853,16 @@ struct ClusteredMapView: UIViewRepresentable {
 
         // 지도가 움직였을 때: 사용자 제스처가 아니더라도, 팔로우 중이면 주기적으로 정류장 재로딩
         // ClusteredMapView.Coord
+        // ClusteredMapView.Coord
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-            // CRASH FIX: 내부 열거 직후 연쇄 호출 경합 완화 (0.30s)
+            // 기존: 내부 열거 직후 연쇄 호출 경합 완화 (0.30s)
             deb.call(after: 0.30) {
+                // 지역 변화에 따른 정류장/데이터 갱신 트리거
                 self.parent.vm.onRegionCommitted(mapView.region)
+
+                // ✅ 새 뷰포트에 들어온 버스들을 즉시 어노테이션으로 "수화"
+                // (updateUIView 갱신을 기다리지 않고 바로 보이게)
+                self.hydrateVisibleBusAnnotations(mapView)
             }
         }
 
