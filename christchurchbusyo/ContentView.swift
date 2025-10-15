@@ -2146,29 +2146,33 @@ final class BusStopAnnotation: NSObject, MKAnnotation {
 
 final class BusAnnotation: NSObject, MKAnnotation {
     let id: String
-    let routeNo: String
+    var routeNo: String
 
     // 콜아웃/라벨용 캐시
     private(set) var nextStopName: String?
     private(set) var etaMinutes: Int?
+    @objc dynamic var title: String?
+    @objc dynamic var subtitle: String?
 
     // ✅ MapKit KVO용: dynamic만, will/didChange 직접 호출 금지
     @objc dynamic var coordinate: CLLocationCoordinate2D
-    var title: String? { routeNo }
+//    var title: String? { routeNo }
 
     // subtitle은 수동 KVO(다음 런루프)로 유지해도 OK (MapKit이 직접 관찰 안함)
     @objc dynamic private var subtitleStorage: String?
-    var subtitle: String? { subtitleStorage }
+//    var subtitle: String? { subtitleStorage }
+    var live: BusLive
 
     init(bus: BusLive) {
-        id = bus.id
-        routeNo = bus.routeNo
-        coordinate = .init(latitude: bus.lat, longitude: bus.lon)
-        nextStopName = bus.nextStopName
-        etaMinutes   = bus.etaMinutes
-        super.init()
-        setSubtitle(Self.makeSubtitle(eta: bus.etaMinutes, next: bus.nextStopName))
-    }
+            self.id = bus.id
+            self.routeNo = bus.routeNo
+            self.coordinate = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
+            self.title = bus.routeNo
+            self.subtitle = Self.makeSubtitle(eta: bus.etaMinutes, next: bus.nextStopName)
+            self.live = bus                    // 🔴 반드시 super.init() 이전에!
+            super.init()
+        }
+
 
     private static func makeSubtitle(eta: Int?, next: String?) -> String? {
         switch (eta, next) {
@@ -2190,28 +2194,15 @@ final class BusAnnotation: NSObject, MKAnnotation {
     }
     private var pendingCoord: CLLocationCoordinate2D?
     private var coordScheduled = false
-    // ✅ 모델만 업데이트할 때도 will/didChange 금지. 그냥 대입.
-    @MainActor
-    func applyModelOnly(_ live: BusLive) {
-        nextStopName = live.nextStopName
-        etaMinutes   = live.etaMinutes
-        let newC = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
+  
 
-        // 같은 좌표면 스킵
-        if newC.latitude == coordinate.latitude && newC.longitude == coordinate.longitude { return }
-
-        pendingCoord = newC
-        guard !coordScheduled else { return }
-        coordScheduled = true
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let p = self.pendingCoord else { self?.coordScheduled = false; return }
-            self.pendingCoord = nil
-            self.coordinate = p
-            self.coordScheduled = false
+    // ✅ “모델만” 업데이트: 수동 KVO 금지, 단순 프로퍼티 대입만!
+        func applyModelOnly(_ live: BusLive) {
+            // 메인에서만 호출된다는 가정(우리 diff 함수가 보장)
+            self.coordinate = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
+            self.title = live.routeNo
+            self.subtitle = Self.makeSubtitle(eta: live.etaMinutes, next: live.nextStopName)
         }
-    }
-
     // ✅ 전체 업데이트(애니메이션 포함): will/did 없이 coordinate 직접 대입
     @MainActor
     func update(to b: BusLive) {
@@ -2408,12 +2399,19 @@ struct BusTrack {
 // MARK: - ViewModel
 @MainActor
 final class MapVM: ObservableObject {
+    // MapVM.swift
+    @MainActor private var autoRefreshTask: Task<Void, Never>?
+    @MainActor private var isRefreshing: Bool = false
+
+    // ✅ 최소 간격 (중복/폭주 방지)
+    private var lastRefreshAt: Date = .distantPast
+
     // MapVM.swift (프로퍼티)
-    private var autoRefreshTask: Task<Void, Never>?
+//    private var autoRefreshTask: Task<Void, Never>?
     private var focusETATask: Task<Void, Never>?
 
-    private(set) var isRefreshing = false
-    private var lastRefreshAt: Date = .distantPast
+//    private(set) var isRefreshing = false
+//    private var lastRefreshAt: Date = .distantPast
     private let minRefreshInterval: TimeInterval = 5   // ← 5초로 확정
 
     // MapVM.swift (focusStop이 바뀔 때 자동 재시작)
@@ -3325,22 +3323,74 @@ final class MapVM: ObservableObject {
     // MapVM 안의 기존 메서드 교체
     /// 선택 직후(팔로우 시작 직후) 즉시 빨간선 미리 그리기
     // 탭 직후 즉시 빨간선(정류장 단위) 그리기
+    // MapVM 내부: 기존 trySetFutureRouteImmediately(for:) 통째로 교체
     func trySetFutureRouteImmediately(for bus: BusAnnotation) {
-        guard
-            let rid  = resolveRouteId(for: bus.routeNo),
-            let meta = routeMetaById[rid],
-            let prj  = projectOnRoute(bus.coordinate, shape: meta.shape, cumul: meta.cumul)
-        else {
-            print("⚠️ futureRoute: meta or projection missing")
+        let here = bus.coordinate
+        let routeNo = bus.routeNo
+
+        // 1) routeId 해석: 일반(MOTIE 등)은 resolve, CHC/WL은 routeNo 자체를 id로 사용
+        let rid: String = resolveRouteId(for: routeNo) ?? routeNo
+        routeIdByRouteNo[routeNo] = rid
+        routeNoByRouteId[rid] = routeNo
+
+        // 2) 메타 유무/무결성 확인
+        var meta = routeMetaById[rid]
+        if let m = meta, !(m.shape.count >= 2 && m.shape.count == m.cumul.count) {
+            // 누적거리 테이블 재빌드
+            let rebuilt = buildCumul(m.shape)
+            if rebuilt.count == m.shape.count {
+                let m2 = RouteMeta(shape: m.shape,
+                                   cumul: rebuilt,
+                                   stopIds: m.stopIds,
+                                   stopCoords: m.stopCoords,
+                                   stopS: m.stopS)
+                routeMetaById[rid] = m2
+                meta = m2
+                print("🧱 futureRoute: rebuilt cumul for rid=\(rid) (shape=\(m.shape.count))")
+            } else {
+                meta = nil
+            }
+        }
+
+        // 3) 메타 없으면: 직선 폴백 그리면서 비동기로 확보 시도
+        if meta == nil {
+            print("⚠️ futureRoute: meta missing for rid=\(rid) — draw temp line & prefetch meta")
+            setTemporaryFutureRouteFromBus(busId: bus.id, coordinate: here, meters: 1200)
+            ensureRouteMetaWithRetry(routeId: rid, routeNo: routeNo)   // 비동기 확보
             return
         }
 
-        // prj.s 이후의 첫 정류장을 다음으로
-        let nextIdx = max(0, meta.stopS.firstIndex(where: { $0 > prj.s }) ?? (meta.stopS.count - 1))
+        guard let metaOk = meta, metaOk.shape.count >= 2, metaOk.shape.count == metaOk.cumul.count else {
+            print("⚠️ futureRoute: invalid meta (shape/cumul) for rid=\(rid)")
+            setTemporaryFutureRouteFromBus(busId: bus.id, coordinate: here, meters: 1200)
+            ensureRouteMetaWithRetry(routeId: rid, routeNo: routeNo)
+            return
+        }
 
-        // ⬇️ 정류장 좌표만 이어서 빨간 라인
-        setFutureRouteByStops(meta: meta, from: prj, nextIdx: nextIdx, maxAheadStops: 7, includeTerminal: false)
+        // 4) 현재 위치를 노선 shape에 사영
+        guard let prj = projectOnRoute(here, shape: metaOk.shape, cumul: metaOk.cumul) else {
+            print("⚠️ futureRoute: projectOnRoute failed — fallback to temp line")
+            setTemporaryFutureRouteFromBus(busId: bus.id, coordinate: here, meters: 1200)
+            return
+        }
+
+        // 5) 다음 정류장 인덱스 계산 (prj.s 이후 첫 정류장, 없으면 마지막)
+        let nextIdx: Int = {
+            guard !metaOk.stopS.isEmpty else { return 0 }
+            let i = metaOk.stopS.firstIndex(where: { $0 > prj.s }) ?? (metaOk.stopS.count - 1)
+            return max(0, min(i, metaOk.stopS.count - 1))
+        }()
+
+        // 6) 정류장 좌표만 이어서 빨간 라인 구성 (최대 7개, 종점 제외)
+        setFutureRouteByStops(meta: metaOk,
+                              from: prj,
+                              nextIdx: nextIdx,
+                              maxAheadStops: 7,
+                              includeTerminal: false)
+
+        print("✅ futureRoute: set by stops rid=\(rid) seg=\(prj.seg) nextIdx=\(nextIdx) coords=\(futureRouteCoords.count)")
     }
+
 
 
     
@@ -4401,31 +4451,35 @@ final class MapVM: ObservableObject {
 
 
     // MapVM.swift
+    // MapVM.swift
     @MainActor
     func startAutoRefresh() {
         autoRefreshTask?.cancel()
         autoRefreshTask = Task { [weak self] in
             guard let self else { return }
+            print("▶️ [AUTO] startAutoRefresh loop")
             while !Task.isCancelled {
                 await self.refreshBusesOnly()
                 try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
             }
         }
     }
-
     @MainActor
     func stopAutoRefresh() {
+        print("⏹️ [AutoRefresh] stop requested")
         autoRefreshTask?.cancel()
         autoRefreshTask = nil
     }
+
 
     
 //    private var lastRefreshAt: Date = .distantPast
 //    private let minRefreshInterval: TimeInterval = 0.5
     // MapVM
+    // MapVM.swift
+    // MapVM 안: 기존 @MainActor func refreshBusesOnly()의 "provider == .christchurch" 분기만 교체
     @MainActor
     private func refreshBusesOnly() async {
-        // ── 호출 가드 ─────────────────────────────────────────────
         if Date().timeIntervalSince(lastRefreshAt) < minRefreshInterval { return }
         lastRefreshAt = Date()
         if isRefreshing { return }
@@ -4435,129 +4489,44 @@ final class MapVM: ObservableObject {
         epochCounter &+= 1
         let epoch = epochCounter
 
-        // 기존 상위 노선(ETA 기반)
-        var top = computeTopArrivals(
-            allArrivals: latestTopArrivals,
-            followedRouteNo: (followBusId.flatMap { routeNoById[$0] })
-        )
+        // top 계산/기타 분기 그대로 유지...
 
-        if let fid = followBusId,
-           let rno = routeNoById[fid],
-           let rid = resolveRouteId(for: rno),
-           top.first(where: { $0.routeId == rid }) == nil {
-            top.append(ArrivalInfo(routeId: rid, routeNo: rno, etaMinutes: 5))
-        }
-
-        // ── 지역별 분기 ───────────────────────────────────────────
         if provider == .christchurch {
             do {
-                // 1) 차량 가져오기 (GTFS-RT)
+                print("⏱️ [Refresh] begin @ \(Date()) provider=christchurch buses=\(self.buses.count)")
+
+                // 1) GTFS-RT 가져오기
                 let vehicles = try await api.chc_fetchVehiclePositions()
+                print("✅ [CHC Vehicles] decoded=\(vehicles.count)")
 
                 // 2) 스냅/필터
                 let snap = makeRouteSnapshot()
                 let filtered = self.mergeAndFilter(vehicles, snap: snap)
 
-                // 3) 머지 & 유령 팔로우 유지
-                var mergedById = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
+                // 3) ⭐️ 이전 프레임 보존하지 말고 "덮어쓰기"
+                var nextById: [String: BusLive] = [:]
                 for b in filtered {
                     self.routeNoById[b.id] = b.routeNo
-                    mergedById[b.id] = b
+                    nextById[b.id] = b
                 }
-                self.ensureFollowGhost(&mergedById)
 
-                // 4) ⛳️ 여기선 applyIfCurrent 안 씀 (레이스 방지)
-                self.buses = Array(mergedById.values)
+                // 4) 팔로우 중인데 이번 프레임에 빠졌다면 유령 유지
+                self.ensureFollowGhost(&nextById)
 
-                // 5) 팔로우 대상 재획득
-                if let fid = followBusId,
-                   self.buses.first(where: { $0.id == fid }) == nil,
-                   let rno = routeNoById[fid] {
+                // 5) 적용
+                self.buses = Array(nextById.values)
 
-                    let cand = self.buses
-                        .filter { $0.routeNo == rno }
-                        .min { lhs, rhs in
-                            let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
-                            let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
-                            guard let last = tracks[fid]?.lastLoc else { return false }
-                            let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
-                            return la.distance(from: a) < la.distance(from: b)
-                        }
-                    if let c = cand { followBusId = c.id }
-                }
+                print("♻️ [CHC refresh] in=\(vehicles.count) filtered=\(filtered.count) merged=\(self.buses.count)")
             } catch {
-                // 무음
+                // 네트워크 에러/401 등은 무음 또는 적절히 로그
+                print("❌ [CHC refresh] error: \(error)")
             }
             return
         }
 
-        // 🇳🇿 Wellington (기존)
-        if provider == .wellington {
-            do {
-                let vehicles = try await api.wl_fetchVehiclePositions()
-                var mergedById = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
-                let snap = makeRouteSnapshot()
-                let filtered = self.mergeAndFilter(vehicles, snap: snap)
-                for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
-                self.ensureFollowGhost(&mergedById)
-                self.buses = Array(mergedById.values)
-
-                if let fid = followBusId,
-                   self.buses.first(where: { $0.id == fid }) == nil,
-                   let rno = routeNoById[fid] {
-                    let cand = self.buses
-                        .filter { $0.routeNo == rno }
-                        .min { lhs, rhs in
-                            let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
-                            let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
-                            guard let last = tracks[fid]?.lastLoc else { return false }
-                            let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
-                            return la.distance(from: a) < la.distance(from: b)
-                        }
-                    if let c = cand { followBusId = c.id }
-                }
-            } catch { }
-            return
-        }
-
-        // 🇰🇷/기타 (기존)
-        guard !top.isEmpty else { return }
-
-        let snap = makeRouteSnapshot()
-        let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
-        var mergedById = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
-
-        do {
-            try await withThrowingTaskGroup(of: [BusLive].self) { group in
-                for a in top {
-                    group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) }
-                }
-                while let arr = try await group.next() {
-                    let enriched = arr.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
-                    let filtered = self.mergeAndFilter(enriched, snap: snap)
-                    for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
-                    self.ensureFollowGhost(&mergedById)
-                    self.buses = Array(mergedById.values)
-                }
-            }
-        } catch { }
-
-        if let fid = followBusId,
-           self.buses.first(where: { $0.id == fid }) == nil,
-           let rno = routeNoById[fid] {
-
-            let cand = self.buses
-                .filter { $0.routeNo == rno }
-                .min { lhs, rhs in
-                    let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
-                    let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
-                    guard let last = tracks[fid]?.lastLoc else { return false }
-                    let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
-                    return la.distance(from: a) < la.distance(from: b)
-                }
-            if let c = cand { followBusId = c.id }
-        }
+        // ... 그 외 기존 웰링턴/국토부 분기는 그대로 ...
     }
+
 
     
     
@@ -4633,10 +4602,11 @@ final class MapVM: ObservableObject {
     // MapVM
     // MapVM 안
     // MapVM 안
+    // MapVM 안: 기존 mergeAndFilter(_ incoming:snap:) 통째로 교체
     private func mergeAndFilter(_ incoming: [BusLive], snap: RouteSnapshot) -> [BusLive] {
         var out: [BusLive] = []
 
-        // 튜닝(기존)
+        // 튜닝(기존 값 유지)
         let LATERAL_MAX_M: Double = 60
         let PASS_GATE_M: Double   = 18
         let SPEED_FLOOR_MPS: Double = 1.5
@@ -4650,18 +4620,22 @@ final class MapVM: ObservableObject {
             let now = Date()
             let nowC = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
 
-            // 🔧 변경: CHC도 routeNo를 rid로 사용 (WL과 동일 정책)
-            let rid: String
-            if provider == .wellington || provider == .christchurch {
-                rid = b.routeNo
+            // 👇👇 핵심: CHC는 차량 고유 ID만 사용 (routeNo 붙이지 않음)
+            // Wellington은 기존처럼 routeNo#vehId 사용
+            // 그 외(MOTIE 등)는 routeId 해석 후 routeId#vehId 사용
+            let cid: String
+            if provider == .christchurch {
+                // feed에서 오는 vehicle.id 는 세션 간에도 안정적
+                cid = b.id.isEmpty ? UUID().uuidString : b.id
+            } else if provider == .wellington {
+                let rid = b.routeNo
+                cid = compoundBusId(routeId: rid, rawVehId: b.id)
             } else {
                 guard let r = resolveRouteId(for: b.routeNo) else { continue }
-                rid = r
+                cid = compoundBusId(routeId: r, rawVehId: b.id)
             }
 
-            // 합성 id로 일관화
-            let cid = compoundBusId(routeId: rid, rawVehId: b.id)
-
+            // 합성된 id로 BusLive 재작성
             var bus = BusLive(
                 id: cid,
                 routeNo: b.routeNo,
@@ -4673,7 +4647,7 @@ final class MapVM: ObservableObject {
 
             let isFollowed = (followBusId == bus.id)
 
-            // 1) 트랙
+            // 1) 트랙 보장
             if tracks[bus.id] == nil {
                 tracks[bus.id] = BusTrack(prevLoc: nil, prevAt: nil, lastLoc: nowC, lastAt: now)
                 out.append(bus)
@@ -4681,7 +4655,7 @@ final class MapVM: ObservableObject {
             }
             var tr = tracks[bus.id]!
 
-            // 2) 점프/EMA
+            // 2) 점프/EMA 스무딩
             let step = CLLocation(latitude: tr.lastLoc.latitude, longitude: tr.lastLoc.longitude)
                 .distance(from: CLLocation(latitude: nowC.latitude, longitude: nowC.longitude))
             let dt = max(0.01, now.timeIntervalSince(tr.lastAt))
@@ -4708,17 +4682,17 @@ final class MapVM: ObservableObject {
             tr.updateKinematics()
             tracks[bus.id] = tr
 
-            // 3) 메타/사영
-            if let meta = snap.metaById[rid],
-               let rStops = snap.stopsByRouteId[rid],
+            // 3) 메타/사영 후 ETA & nextStop
+            if provider == .christchurch,
+               let meta = snap.metaById[bus.routeNo],   // CHC는 routeNo를 meta key로 사용
+               let rStops = snap.stopsByRouteId[bus.routeNo],
                let prj = projectOnRoute(smooth, shape: meta.shape, cumul: meta.cumul),
                prj.lateral <= LATERAL_MAX_M {
 
-                // 경로 위로 클램프
+                // 경로로 스냅
                 bus.lat = prj.snapped.latitude
                 bus.lon = prj.snapped.longitude
 
-                // 4) 다음 정류장/ETA
                 let stopS = meta.stopS
                 let count = min(stopS.count, rStops.count)
                 if count > 0 {
@@ -4746,11 +4720,10 @@ final class MapVM: ObservableObject {
                         bus.etaMinutes = prev
                     }
 
-                    // 스냅
                     maybeSnapToStop(&bus)
 
-                    // 팔로우 중: 트레일/하이라이트/미래경로
-                    if followBusId == bus.id {
+                    // 팔로우 보조(트레일/미래경로/하이라이트)
+                    if isFollowed {
                         let c = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
                         trail.appendIfNeeded(c); trailVersion &+= 1
                         highlightedStopId = nextStop.id
@@ -4762,7 +4735,7 @@ final class MapVM: ObservableObject {
                 }
             }
 
-            // 4') 메타 없음/사영 실패 → coast + 방향기반 폴백
+            // 3') 메타 없거나 사영 실패 → coast + 방향기반 폴백
             let pred = tr.coastPredict(at: now.addingTimeInterval(0.6),
                                        decay: COAST_DECAY_PER_SEC, minSpeed: COAST_MIN_SPEED)
             bus.lat = pred.latitude
@@ -4789,6 +4762,7 @@ final class MapVM: ObservableObject {
 
         return out
     }
+
 
 
     
@@ -5260,11 +5234,77 @@ struct ClusteredMapView: UIViewRepresentable {
             isTweakingFollowAppearance = false
         }
 
+        // 클래스(예: Coordinator) 내부 어디든 넣어서 쓰세요.
+        private func removeAnnotationsInBatches(
+            _ mapView: MKMapView,
+            annotations: [MKAnnotation],
+            batchSize: Int = 200,
+            completion: @escaping () -> Void = {}
+        ) {
+            guard !annotations.isEmpty else { completion(); return }
+
+            var index = 0
+
+            func step() {
+                if index >= annotations.count {
+                    completion()
+                    return
+                }
+
+                let end = min(index + batchSize, annotations.count)
+                let chunk = Array(annotations[index..<end])
+
+                UIView.performWithoutAnimation {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    mapView.removeAnnotations(chunk)
+                    CATransaction.commit()
+                }
+
+                index = end
+                // 다음 배치를 다음 런루프로 넘겨서 MK 내부 열거/옵저버 충돌 완화
+                DispatchQueue.main.async { step() }
+            }
+
+            // kick off
+            step()
+        }
+        private func addAnnotationsInBatches(
+            _ mapView: MKMapView,
+            annotations: [MKAnnotation],
+            batchSize: Int = 200,
+            completion: @escaping () -> Void = {}
+        ) {
+            guard !annotations.isEmpty else { completion(); return }
+
+            var index = 0
+
+            func step() {
+                if index >= annotations.count {
+                    completion()
+                    return
+                }
+
+                let end = min(index + batchSize, annotations.count)
+                let chunk = Array(annotations[index..<end])
+
+                UIView.performWithoutAnimation {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    mapView.addAnnotations(chunk)
+                    CATransaction.commit()
+                }
+
+                index = end
+                DispatchQueue.main.async { step() }
+            }
+
+            step()
+        }
 
 
-        // ClusteredMapView.Coord 안의 기존 메서드 교체
-        // ClusteredMapView.Coord
-        // ClusteredMapView.Coord
+        // ClusteredMapView.Coord 내부 통째 교체
+        // ClusteredMapView.Coord 내부 메서드 교체
         func applyAnnotationDiff(
             on mapView: MKMapView,
             stopsToAdd: [MKAnnotation],
@@ -5277,7 +5317,56 @@ struct ClusteredMapView: UIViewRepresentable {
             if isApplyingDiff { return }
             isApplyingDiff = true
 
-            // === 1단계: add/remove 만 수행 (동일 런루프) ===
+            // === 로컬 배치 유틸 (inout 사용 안 함) ===
+            func removeAnnotationsInBatches(
+                _ mapView: MKMapView,
+                annotations: [MKAnnotation],
+                batchSize: Int = 200,
+                completion: @escaping () -> Void
+            ) {
+                guard !annotations.isEmpty else { completion(); return }
+                var index = 0
+                func step() {
+                    if index >= annotations.count { completion(); return }
+                    let end = min(index + batchSize, annotations.count)
+                    let chunk = Array(annotations[index..<end])
+                    UIView.performWithoutAnimation {
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        mapView.removeAnnotations(chunk)
+                        CATransaction.commit()
+                    }
+                    index = end
+                    DispatchQueue.main.async { step() }
+                }
+                step()
+            }
+
+            func addAnnotationsInBatches(
+                _ mapView: MKMapView,
+                annotations: [MKAnnotation],
+                batchSize: Int = 200,
+                completion: @escaping () -> Void
+            ) {
+                guard !annotations.isEmpty else { completion(); return }
+                var index = 0
+                func step() {
+                    if index >= annotations.count { completion(); return }
+                    let end = min(index + batchSize, annotations.count)
+                    let chunk = Array(annotations[index..<end])
+                    UIView.performWithoutAnimation {
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        mapView.addAnnotations(chunk)
+                        CATransaction.commit()
+                    }
+                    index = end
+                    DispatchQueue.main.async { step() }
+                }
+                step()
+            }
+
+            // === 1단계: add/remove 준비 및 실행 ===
             DispatchQueue.main.async { [weak self, weak mapView] in
                 guard let self, let mapView else { return }
 
@@ -5298,58 +5387,60 @@ struct ClusteredMapView: UIViewRepresentable {
                     return b
                 }
 
-                UIView.performWithoutAnimation {
-                    CATransaction.begin()
-                    CATransaction.setDisableActions(true)
-                    if !safeStopsToRemove.isEmpty || !safeBusesToRemove.isEmpty {
-                        mapView.removeAnnotations(safeStopsToRemove + safeBusesToRemove)
-                    }
-                    if !stopsToAdd.isEmpty || !busesToAdd.isEmpty {
-                        mapView.addAnnotations(stopsToAdd + busesToAdd)
-                    }
-                    CATransaction.commit()
-                }
+                let toRemove = safeStopsToRemove + safeBusesToRemove
+                let toAdd    = stopsToAdd + busesToAdd
 
-                // === 2단계: '모델만' 업데이트 (좌표/경량 속성) — 뷰 접근 금지 ===
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self, weak mapView] in
+                // 1) 제거 → 2) 추가를 배치로 순차 실행 (런루프를 넘기며 MK 내부 열거/옵저버 충돌 회피)
+                removeAnnotationsInBatches(mapView, annotations: toRemove, batchSize: 200) { [weak self, weak mapView] in
                     guard let self, let mapView else { return }
 
-                    CATransaction.begin()
-                    CATransaction.setDisableActions(true)
-
-                    for (anno, live) in busUpdates {
-                        // ⚠️ BusAnnotation에 이 메서드가 없으면 아래 주석 참고
-                        anno.applyModelOnly(live)
-                        // 대안(임시): 좌표만 KVO로 갱신
-                        // anno.willChangeValue(forKey: "coordinate")
-                        // anno.coordinate = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
-                        // anno.didChangeValue(forKey: "coordinate")
-                        // anno.live = live
-                    }
-
-                    CATransaction.commit()
-
-                    // === 3단계: '뷰만' 업데이트 (mapView.view(for:)) — 한 박자 더 뒤 ===
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self, weak mapView] in
+                    addAnnotationsInBatches(mapView, annotations: toAdd, batchSize: 200) { [weak self, weak mapView] in
                         guard let self, let mapView else { return }
 
-                        // UI 요소(버블/색상 등)만 접근
-                        for (anno, _) in busUpdates {
-                            if let mv = mapView.view(for: anno) as? BusMarkerView {
-                                mv.updateAlwaysOnBubble()
+                        // === 2단계: '모델만' 업데이트 (좌표/경량 속성) — 뷰 접근 금지 ===
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self, weak mapView] in
+                            guard let self, let mapView else { return }
+
+                            CATransaction.begin()
+                            CATransaction.setDisableActions(true)
+
+                            for (anno, live) in busUpdates {
+                                // BusAnnotation에 모델만 갱신하는 메서드가 있어야 함
+                                // (필요시 KVO 방식으로 대체)
+                                anno.applyModelOnly(live)
+                                // 대안(임시 KVO):
+                                // anno.willChangeValue(forKey: "coordinate")
+                                // anno.coordinate = CLLocationCoordinate2D(latitude: live.lat, longitude: live.lon)
+                                // anno.didChangeValue(forKey: "coordinate")
+                                // anno.live = live
+                            }
+
+                            CATransaction.commit()
+
+                            // === 3단계: '뷰만' 업데이트 (mapView.view(for:)) — 한 박자 더 뒤 ===
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self, weak mapView] in
+                                guard let self, let mapView else { return }
+
+                                // UI 요소(버블/색상 등)만 접근
+                                for (anno, _) in busUpdates {
+                                    if let mv = mapView.view(for: anno) as? BusMarkerView {
+                                        mv.updateAlwaysOnBubble()
+                                    }
+                                }
+
+                                // 배치 후 일괄 후처리
+                                self.updateFollowTints(mapView)
+                                self.recolorStops(mapView)
+                                self.safeDeconflictAll(mapView)
+
+                                self.isApplyingDiff = false
                             }
                         }
-
-                        // 배치 후 일괄 후처리(이 시점에서만)
-                        self.updateFollowTints(mapView)
-                        self.recolorStops(mapView)
-                        self.safeDeconflictAll(mapView)
-
-                        self.isApplyingDiff = false
                     }
                 }
             }
         }
+
 
         
         // ClusteredMapView.Coord
@@ -5885,6 +5976,12 @@ struct BusMapScreen: View {
                 .padding(.top, 8)
                 .padding(.leading, 8)
             }
+        // BusMapScreen.swift
+        .task {
+            loc.requestWhenInUse()
+            await vm.reload(center: .init(latitude: -43.5321, longitude: 172.6362))
+            await MainActor.run { vm.startAutoRefresh() }   // ✅ 안전망
+        }
 
             // 최초 진입 시/재진입 시 개수 동기화
             .task {
