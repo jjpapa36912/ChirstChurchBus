@@ -15,18 +15,25 @@ import CoreLocation
 import Foundation
 import simd
 import GoogleMobileAds
+import SwiftProtobuf
+
 // 어디 공용 파일(예: BusAPI.swift 상단)에 추가
 struct StringOrInt: Codable {
     let value: String
-    init(from decoder: Decoder) throws {
+
+    init(from decoder: Swift.Decoder) throws {
         let c = try decoder.singleValueContainer()
         if let s = try? c.decode(String.self) { value = s; return }
-        if let i = try? c.decode(Int.self) { value = String(i); return }
-        if let i64 = try? c.decode(Int64.self) { value = String(i64); return }
-        throw DecodingError.typeMismatch(String.self, .init(codingPath: decoder.codingPath,
-                                                            debugDescription: "Expected String or Int"))
+        if let i = try? c.decode(Int.self)    { value = String(i); return }
+        if let i64 = try? c.decode(Int64.self){ value = String(i64); return }
+        throw Swift.DecodingError.typeMismatch(
+            String.self,
+            .init(codingPath: decoder.codingPath,
+                  debugDescription: "Expected String or Int")
+        )
     }
-    func encode(to encoder: Encoder) throws {
+
+    func encode(to encoder: Swift.Encoder) throws {
         var c = encoder.singleValueContainer()
         try c.encode(value)
     }
@@ -48,7 +55,7 @@ extension Notification.Name {
 //}
 private struct WLEnvelope<T: Decodable>: Decodable {
     let data: [T]?
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         let c = try decoder.singleValueContainer()
         if let boxed = try? c.decode([String:AnyDecodable].self),
            let d = boxed["data"], case let .array(arr) = d {
@@ -65,7 +72,7 @@ private struct WLEnvelope<T: Decodable>: Decodable {
 /// AnyDecodable (간단판)
 private enum AnyDecodable: Decodable {
     case dict([String: AnyDecodable]), array([AnyDecodable]), str(String), num(Double), bool(Bool), null
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         let c = try decoder.singleValueContainer()
         if c.decodeNil() { self = .null; return }
         if let b = try? c.decode(Bool.self)   { self = .bool(b); return }
@@ -176,7 +183,7 @@ enum APIError: Error { case invalidURL, http(Int), decode(Error) }
 // MARK: - Flex decoders
 struct FlexString: Decodable {
     let value: String
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         let c = try decoder.singleValueContainer()
         if let s = try? c.decode(String.self) { value = s; return }
         if let i = try? c.decode(Int.self)    { value = String(i); return }
@@ -190,7 +197,7 @@ struct FlexString: Decodable {
 }
 struct FlexInt: Decodable {
     let value: Int?
-    init(from d: Decoder) throws {
+    init(from d: Swift.Decoder) throws {
         let c = try d.singleValueContainer()
         if let i = try? c.decode(Int.self) { value = i }
         else if let s = try? c.decode(String.self) { value = Int(s) }
@@ -199,7 +206,7 @@ struct FlexInt: Decodable {
 }
 struct FlexDouble: Decodable {
     let value: Double
-    init(from d: Decoder) throws {
+    init(from d: Swift.Decoder) throws {
         let c = try d.singleValueContainer()
         if let v = try? c.decode(Double.self) { value = v }
         else if let s = try? c.decode(String.self), let v = Double(s.replacingOccurrences(of: ",", with: "")) { value = v }
@@ -290,7 +297,30 @@ struct WLStop: Decodable {
 }
 // MARK: - API
 final class BusAPI: NSObject, URLSessionDelegate {
-    
+    @MainActor
+    func chc_debugDumpVehiclesOnce() async {
+        do {
+            let url = URL(string: "https://apis.metroinfo.co.nz/rti/gtfsrt/v1/vehicle-positions.pb")!
+            var req = URLRequest(url: url)
+            req.setValue(CHCAuth.subscriptionKey, forHTTPHeaderField: "Ocp-Apim-Subscription-Key")
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let http = resp as! HTTPURLResponse
+            print("📡 [CHC PB] HTTP=\(http.statusCode) bytes=\(data.count)")
+
+            let feed = try TransitRealtime_FeedMessage(serializedData: data)
+            print("✅ [CHC PB] entities=\(feed.entity.count)")
+
+            for (i, ent) in feed.entity.prefix(5).enumerated() {
+                let p = ent.vehicle.position        // non-optional
+                let t = ent.vehicle.trip
+                let route = t.routeID.isEmpty ? (t.tripID.isEmpty ? "?" : t.tripID) : t.routeID
+                print("   [#\(i)] route=\(route) lat=\(p.latitude) lon=\(p.longitude)")
+            }
+        } catch {
+            print("❌ [CHC PB] error:", error)
+        }
+    }
+
     
     // ✅ 번들에서 CHC 정류장 json을 캐시로 읽음
     private var _chcStopsCache: [BusStop] = []
@@ -410,141 +440,119 @@ final class BusAPI: NSObject, URLSessionDelegate {
     // Christchurch: Stop Monitoring (SIRI) API
     // https://apis.metroinfo.co.nz/rti/siri/v1/sm?stopcode=####
     func chc_fetchArrivals(stopCode: String) async throws -> [ArrivalInfo] {
-        guard let url = URL(string: "https://apis.metroinfo.co.nz/rti/siri/v1/sm?stopcode=\(stopCode)") else {
-            throw URLError(.badURL)
+           // 기본 쿼리: stopcode + orderby(가장 빨리 오는 순)
+           var comp = URLComponents(string: "https://apis.metroinfo.co.nz/rti/siri/v1/sm")!
+           comp.queryItems = [
+               .init(name: "stopcode", value: stopCode),
+               .init(name: "orderby",  value: "soonest"),
+               .init(name: "format",   value: "json") // JSON 확실히 받고 싶을 때
+           ]
+           var req = URLRequest(url: comp.url!)
+           req.setValue("application/json", forHTTPHeaderField: "Accept")
+           req.setValue(CHCAuth.subscriptionKey, forHTTPHeaderField: "Ocp-Apim-Subscription-Key")
+
+           let (data, http) = try await send("CHC ETA", request: req)
+           guard http.statusCode == 200, !data.isEmpty else {
+               print("❌ [CHC ETA] HTTP \(http.statusCode) bytes=\(data.count)")
+               return []
+           }
+
+           // ==== 최소 JSON 모델 ====
+           struct SiriResponse: Decodable {
+               struct Siri: Decodable {
+                   struct ServiceDelivery: Decodable {
+                       struct StopMonitoringDelivery: Decodable {
+                           let MonitoredStopVisit: [Visit]?
+                       }
+                       let StopMonitoringDelivery: [StopMonitoringDelivery]?
+                   }
+                   let ServiceDelivery: ServiceDelivery
+               }
+               let Siri: Siri
+           }
+           struct Visit: Decodable {
+               struct Journey: Decodable {
+                   let LineRef: String?
+                   let DestinationName: String?
+                   let MonitoredCall: Call?
+               }
+               let MonitoredVehicleJourney: Journey
+           }
+           struct Call: Decodable {
+               let ExpectedArrivalTime: String?
+               let ExpectedDepartureTime: String?
+           }
+
+           let decoded = try JSONDecoder().decode(SiriResponse.self, from: data)
+           let visits = decoded.Siri.ServiceDelivery
+               .StopMonitoringDelivery?.flatMap { $0.MonitoredStopVisit ?? [] } ?? []
+
+           let fmt = ISO8601DateFormatter()
+           let arrivals: [ArrivalInfo] = visits.compactMap { v in
+               guard let line = v.MonitoredVehicleJourney.LineRef else { return nil }
+
+               let etaMin: Int? = {
+                   if let t = v.MonitoredVehicleJourney.MonitoredCall?.ExpectedArrivalTime,
+                      let dt = fmt.date(from: t) { return max(0, Int(dt.timeIntervalSinceNow / 60)) }
+                   if let t = v.MonitoredVehicleJourney.MonitoredCall?.ExpectedDepartureTime,
+                      let dt = fmt.date(from: t) { return max(0, Int(dt.timeIntervalSinceNow / 60)) }
+                   return nil
+               }()
+               guard let eta = etaMin else { return nil }
+
+               return ArrivalInfo(routeId: line, routeNo: line, etaMinutes: eta)
+           }
+
+           print("✅ [CHC ETA] stop=\(stopCode) items=\(arrivals.count)")
+           return arrivals
+       }
+
+    func chc_fetchVehiclePositions() async throws -> [BusLive] {
+           guard let url = URL(string: "https://apis.metroinfo.co.nz/rti/gtfsrt/v1/vehicle-positions.pb") else {
+               throw URLError(.badURL)
+           }
+           var req = URLRequest(url: url)
+           req.setValue(CHCAuth.subscriptionKey, forHTTPHeaderField: "Ocp-Apim-Subscription-Key")
+
+           let (data, resp) = try await URLSession.shared.data(for: req)
+           let http = resp as! HTTPURLResponse
+           guard http.statusCode == 200, !data.isEmpty else {
+               print("❌ [CHC Vehicles] HTTP \(http.statusCode) bytes=\(data.count)")
+               return []
+           }
+
+           // TransitRealtime_FeedMessage 는 gtfs-realtime.proto 컴파일 산출 타입명 (환경에 따라 접두사 다를 수 있음)
+           let feed = try TransitRealtime_FeedMessage(serializedData: data)
+
+           var out: [BusLive] = []
+           out.reserveCapacity(feed.entity.count)
+
+        for ent in feed.entity {
+            let vp = ent.vehicle.position   // non-optional 값
+            let lat = Double(vp.latitude)
+            let lon = Double(vp.longitude)
+
+            let route = ent.vehicle.trip.routeID.isEmpty
+                       ? (ent.vehicle.trip.tripID.isEmpty ? "?" : ent.vehicle.trip.tripID)
+                       : ent.vehicle.trip.routeID
+            let routeNo = route.split(separator: "-").first.map(String.init) ?? route
+
+            out.append(BusLive(
+                id: ent.id.isEmpty
+                    ? (ent.vehicle.vehicle.id.isEmpty ? UUID().uuidString : ent.vehicle.vehicle.id)
+                    : ent.id,
+                routeNo: routeNo.uppercased(),
+                lat: lat,
+                lon: lon,
+                etaMinutes: nil,
+                nextStopName: nil
+            ))
         }
 
-        var req = URLRequest(url: url)
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.setValue(CHCAuth.subscriptionKey, forHTTPHeaderField: "Ocp-Apim-Subscription-Key")
 
-        let (data, http) = try await send("CHC ETA", request: req)
-        print("📩 [CHC ETA] HTTP \(http.statusCode) bytes=\(data.count)")
-
-        // ==== 응답 모델 정의 ====
-        struct SiriResponse: Decodable {
-            struct Siri: Decodable {
-                struct ServiceDelivery: Decodable {
-                    struct StopMonitoringDelivery: Decodable {
-                        let MonitoredStopVisit: [Visit]?
-                    }
-                    let StopMonitoringDelivery: [StopMonitoringDelivery]?
-                }
-                let ServiceDelivery: ServiceDelivery
-            }
-            let Siri: Siri
-        }
-        struct Visit: Decodable {
-            struct Journey: Decodable {
-                let LineRef: String?
-                let DestinationName: String?
-                let MonitoredCall: Call?
-            }
-            let MonitoredVehicleJourney: Journey
-        }
-        struct Call: Decodable {
-            let ExpectedArrivalTime: String?
-            let ExpectedDepartureTime: String?
-        }
-
-        do {
-            // ==== 디코딩 ====
-            let decoded = try JSONDecoder().decode(SiriResponse.self, from: data)
-            let visits = decoded.Siri.ServiceDelivery
-                .StopMonitoringDelivery?.flatMap { $0.MonitoredStopVisit ?? [] } ?? []
-            print("ℹ️ [CHC ETA] decoded visits=\(visits.count)")
-
-            // ==== 변환 → ArrivalInfo ====
-            let arrivals: [ArrivalInfo] = visits.compactMap { v -> ArrivalInfo? in
-                guard let line = v.MonitoredVehicleJourney.LineRef else {
-                    print("⚠️ [CHC ETA] skip: no LineRef")
-                    return nil
-                }
-                guard let dest = v.MonitoredVehicleJourney.DestinationName else {
-                    print("⚠️ [CHC ETA] skip: no DestinationName for line=\(line)")
-                    return nil
-                }
-
-                let etaMin: Int? = {
-                    let fmt = ISO8601DateFormatter()
-                    if let t = v.MonitoredVehicleJourney.MonitoredCall?.ExpectedArrivalTime,
-                       let dt = fmt.date(from: t) {
-                        return max(0, Int(dt.timeIntervalSinceNow / 60))
-                    }
-                    if let t = v.MonitoredVehicleJourney.MonitoredCall?.ExpectedDepartureTime,
-                       let dt = fmt.date(from: t) {
-                        return max(0, Int(dt.timeIntervalSinceNow / 60))
-                    }
-                    return nil
-                }()
-
-                guard let eta = etaMin else {
-                    print("⚠️ [CHC ETA] skip: no ETA for line=\(line)")
-                    return nil
-                }
-
-                let info = ArrivalInfo(
-                    routeId: line,
-                    routeNo: line,
-                    etaMinutes: eta
-                )
-                print("✅ [CHC ETA] \(line) → \(eta)m · \(dest)")
-                return info
-            }
-
-            return arrivals
-        } catch {
-            let head = String(data: Data(data.prefix(240)), encoding: .utf8) ?? ""
-            print("❌ [CHC ETA] decode fail head='\(head)' error=\(error)")
-            throw error
-        }
-    }
-
-
-    func chc_fetchVehiclePositions(routeFilter: String? = nil) async throws -> [BusLive] {
-            let base = "https://apis.metroinfo.co.nz"
-            // 예: 서버가 JSON 변환을 /rti/gtfsrt/v1/vehicle-positions.json 으로 제공한다고 가정
-            let url = URL(string: "\(base)/rti/gtfsrt/v1/vehicle-positions.json")!
-
-            let (data, http) = try await send("CHC Vehicles", url: url)
-
-            struct VP: Decodable {
-                let vehicle_id: String?
-                let route_id: String?
-                let route_short_name: String?
-                let latitude: Double?
-                let longitude: Double?
-                // 필요시 timestamp 등 추가
-            }
-
-            do {
-                let box = try JSONDecoder().decode(JSONAPIList<VP>.self, from: data)
-                var arr = box.data.compactMap { res -> BusLive? in
-                    let v = res.attributes
-                    guard let la = v.latitude, let lo = v.longitude else { return nil }
-                    let rid = (v.route_short_name ?? v.route_id ?? "?").trimmingCharacters(in: .whitespaces)
-                    let rno = rid.split(separator: "-").first.map(String.init) ?? rid
-                    return BusLive(
-                        id: v.vehicle_id ?? res.id,
-                        routeNo: rno,
-                        lat: la, lon: lo,
-                        etaMinutes: nil, nextStopName: nil
-                    )
-                }
-                if let f = routeFilter, !f.isEmpty {
-                    let full = f.uppercased()
-                    let pre  = full.split(separator: "-").first.map(String.init) ?? full
-                    arr = arr.filter { $0.routeNo.uppercased() == pre || $0.routeNo.uppercased() == full }
-                }
-                print("✅ [CHC Vehicles] \(http.statusCode) vehicles=\(arr.count)")
-                return arr
-            } catch {
-                if let s = String(data: data, encoding: .utf8) {
-                    print("❌ [CHC Vehicles] decode fail. head=\(s.prefix(240)) error=\(error)")
-                }
-                throw error
-            }
-        }
+           print("✅ [CHC Vehicles] decoded=\(out.count)")
+           return out
+       }
     /// Christchurch: 지도 중심 근처 정류장 검색 (JSON 포맷 변조 허용)
     // BusAPI.swift
     /// ❗️CHC에는 근처 정류장 geo-검색 엔드포인트가 없어 404가 정상입니다.
@@ -1276,7 +1284,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
 
         enum CodingKeys: String, CodingKey { case response, entity }
 
-        init(from decoder: Decoder) throws {
+        init(from decoder: Swift.Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             if let r = try? c.decode(Resp.self, forKey: .response) {
                 entity = r.entity ?? []
@@ -1316,7 +1324,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
     // 객체 or 배열 둘 다 받아주기
     struct OneOrMany<T: Decodable>: Decodable {
         let values: [T]
-        init(from decoder: Decoder) throws {
+        init(from decoder: Swift.Decoder) throws {
             let c = try decoder.singleValueContainer()
             if let arr = try? c.decode([T].self) {
                 values = arr
@@ -1372,7 +1380,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
         let entity: [E]
         private struct Resp: Decodable { let entity: [E]? }
         enum CodingKeys: String, CodingKey { case response, entity }
-        init(from decoder: Decoder) throws {
+        init(from decoder: Swift.Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             if let resp = try? c.decode(Resp.self, forKey: .response) {
                 entity = resp.entity ?? []
@@ -1518,7 +1526,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 let gpsLati: FlexDouble?
                 let gpsLong: FlexDouble?
                 enum CodingKeys: String, CodingKey { case gpsLati, gpsLong, gpslati, gpslong }
-                init(from d: Decoder) throws {
+                init(from d: Swift.Decoder) throws {
                     let c = try d.container(keyedBy: CodingKeys.self)
                     gpsLati = (try? c.decode(FlexDouble.self, forKey: .gpsLati)) ?? (try? c.decode(FlexDouble.self, forKey: .gpslati))
                     gpsLong = (try? c.decode(FlexDouble.self, forKey: .gpsLong)) ?? (try? c.decode(FlexDouble.self, forKey: .gpslong))
@@ -1831,7 +1839,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
         let entity: [T]
         private struct Resp: Decodable { let entity: [T] }
         private struct Wrapped: Decodable { let response: Resp }
-        init(from decoder: Decoder) throws {
+        init(from decoder: Swift.Decoder) throws {
             let c = try decoder.singleValueContainer()
             if let w = try? c.decode(Wrapped.self) { entity = w.response.entity; return }
             if let d = try? c.decode(Resp.self)     { entity = d.entity; return }
@@ -1886,10 +1894,10 @@ final class BusAPI: NSObject, URLSessionDelegate {
     // MARK: - Arrivals (AT legacy tripupdates, with robust stop_id matching + rich logs)
     func fetchArrivalsDetailed(cityCode: Int, nodeId: String) async throws -> [ArrivalInfo] {
         struct SafeDecodable<T: Decodable>: Decodable { let value: T?
-            init(from d: Decoder) throws { let c = try d.singleValueContainer(); self.value = try? c.decode(T.self) } }
+            init(from d: Swift.Decoder) throws { let c = try d.singleValueContainer(); self.value = try? c.decode(T.self) } }
 
         struct OneOrMany<T: Decodable>: Decodable { let values: [T]
-            init(from d: Decoder) throws {
+            init(from d: Swift.Decoder) throws {
                 let c = try d.singleValueContainer()
                 if let one = try? c.decode(T.self) { values = [one]; return }
                 values = (try? c.decode([T].self)) ?? []
@@ -2017,7 +2025,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
 
         struct SafeDecodable<T: Decodable>: Decodable {
             let value: T?
-            init(from d: Decoder) throws {
+            init(from d: Swift.Decoder) throws {
                 let c = try d.singleValueContainer()
                 self.value = try? c.decode(T.self)
             }
@@ -2400,6 +2408,32 @@ struct BusTrack {
 // MARK: - ViewModel
 @MainActor
 final class MapVM: ObservableObject {
+    // MapVM.swift (focusStop이 바뀔 때 자동 재시작)
+    @Published var focusStop: BusStop? {
+        didSet { restartFocusETAAutoRefresh() }
+    }
+
+    @MainActor
+    private func restartFocusETAAutoRefresh() {
+        focusETATask?.cancel()
+        guard focusStop != nil else { return }
+
+        focusETATask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                await self.refreshFocusStopETA()
+                try? await Task.sleep(nanoseconds: 15 * 1_000_000_000) // 15초마다
+            }
+        }
+    }
+
+    // MapVM.swift (프로퍼티 영역)
+    private var autoRefreshTask: Task<Void, Never>? = nil
+    private var focusETATask: Task<Void, Never>? = nil
+
+    /// 버스 위치 새로고침 주기(초)
+    @Published var refreshIntervalSec: Int = 5
+
     static let shared = MapVM()   // ✅ 싱글턴 인스턴스
 
     @Published var stops: [BusStop] = []
@@ -2474,7 +2508,7 @@ final class MapVM: ObservableObject {
     @Published var stickToFollowedBus: Bool = false
     
     // MapVM 내부
-    @Published var focusStop: BusStop? = nil              // 현재 정보 패널에 띄울 정류소
+//    @Published var focusStop: BusStop? = nil              // 현재 정보 패널에 띄울 정류소
     @Published var focusStopETAs: [ArrivalInfo] = []      // 해당 정류소의 ETA 전체(스냅샷)
     @Published var focusStopLoading: Bool = false
 
@@ -4175,23 +4209,49 @@ final class MapVM: ObservableObject {
                 // MapVM.reload(center:) 내부 switch provider
                 // MapVM.reload(center:) 내부 switch provider
 
-                case .christchurch:
-                    // ① 번들 캐시에서 근처 정류장 추리기
+            case .christchurch:
+                do {
+                    // ① 근처 정류장(번들)
                     let near = api.chc_nearbyStopsFromBundle(center: center, radiusMeters: 800)
                     applyIfCurrent(epoch: epoch) {
                         self.stops = near
                         self.integrateKnownStops(near)
                     }
-                    print("ℹ️ [CHC Reload] center=(\(center.latitude),\(center.longitude)) stops=\(near.count)")
+                    print("ℹ️ [CHC Reload] stops=\(near.count) center=(\(center.latitude),\(center.longitude))")
 
-                    // ② 실시간 ETA/차량: 정류장 탭 시에만 SIRI(sm)로
-                    applyIfCurrent(epoch: epoch) {
-                        self.latestTopArrivals = []
-                        self.buses = []
+                    // ② 차량 위치(Protobuf)
+                    let veh = try await api.chc_fetchVehiclePositions()
+                    print("🛰️ [CHC Vehicles] raw=\(veh.count) sample=\(veh.prefix(3))")
+
+                    // ⚠️ 1차: 필터 우회(그대로 지도에 뿌려 보기)
+                    if !veh.isEmpty {
+                        applyIfCurrent(epoch: epoch) {
+                            self.buses = veh.map { v in
+                                var m = v
+                                // 좌표 sanity check (0,0 방지)
+                                if abs(m.lat) < 0.0001 && abs(m.lon) < 0.0001 {
+                                    m.lat = center.latitude
+                                    m.lon = center.longitude
+                                }
+                                return m
+                            }
+                            self.latestTopArrivals = []
+                        }
+                        print("✅ [CHC] set buses=\(veh.count) (no filter)")
+                    } else {
+                        // 비었으면 일단 비우고 리턴
+                        applyIfCurrent(epoch: epoch) { self.buses = []; self.latestTopArrivals = [] }
+                        print("⚠️ [CHC] vehicles empty")
                     }
 
-                    startAutoRefresh()   // 타이머는 유지(버스 추적/패널 등 내부 로직 호환)
-                    return
+                } catch {
+                    print("❌ [CHC Reload] error: \(error)")
+                    applyIfCurrent(epoch: epoch) { self.buses = []; self.latestTopArrivals = [] }
+                }
+                startAutoRefresh()
+                return
+
+
 
 
             // ----------------------------
@@ -4329,20 +4389,32 @@ final class MapVM: ObservableObject {
 
 
 
-    private func startAutoRefresh() {
-        autoTask?.cancel()
-        autoTask = Task { [weak self] in
+    // MapVM.swift
+    @MainActor
+    func startAutoRefresh() {
+        // 중복 방지
+        autoRefreshTask?.cancel()
+        autoRefreshTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: BUS_REFRESH_SEC * 1_000_000_000)
                 await self.refreshBusesOnly()
+                try? await Task.sleep(nanoseconds: UInt64(max(1, self.refreshIntervalSec)) * 1_000_000_000)
             }
         }
     }
+
+    @MainActor
+    func stopAutoRefresh() {
+        autoRefreshTask?.cancel()
+        autoRefreshTask = nil
+    }
+    
     private var lastRefreshAt: Date = .distantPast
     private let minRefreshInterval: TimeInterval = 0.5
     // MapVM
+    @MainActor
     private func refreshBusesOnly() async {
+        // ── 호출 가드 ─────────────────────────────────────────────
         if Date().timeIntervalSince(lastRefreshAt) < minRefreshInterval { return }
         lastRefreshAt = Date()
         if isRefreshing { return }
@@ -4352,11 +4424,13 @@ final class MapVM: ObservableObject {
         epochCounter &+= 1
         let epoch = epochCounter
 
-        // 기존 상위 노선(ETA 기반)
-        var top = computeTopArrivals(allArrivals: latestTopArrivals,
-                                     followedRouteNo: (followBusId.flatMap { routeNoById[$0] }))
+        // 기존 상위 노선(ETA 기반) – 일부 지역에서 사용
+        var top = computeTopArrivals(
+            allArrivals: latestTopArrivals,
+            followedRouteNo: (followBusId.flatMap { routeNoById[$0] })
+        )
 
-        // 팔로우 중이면 해당 노선 유지
+        // 팔로우 중이면 해당 노선 강제 포함(ETA 비었어도 최소 유지)
         if let fid = followBusId,
            let rno = routeNoById[fid],
            let rid = resolveRouteId(for: rno),
@@ -4364,8 +4438,54 @@ final class MapVM: ObservableObject {
             top.append(ArrivalInfo(routeId: rid, routeNo: rno, etaMinutes: 5))
         }
 
-        // 💡 웰링턴은 전 노선 차량을 한 번에 가져오는 경우가 많아서 별 처리
-        if provider == .wellington {
+        // ── 지역별 분기 ───────────────────────────────────────────
+        switch provider {
+
+        // 🇳🇿 Christchurch — GTFS-RT(Protobuf) 전 차량 주기 갱신
+        case .christchurch:
+            do {
+                // 1) 차량 위치 가져오기 (Protobuf → BusLive)
+                let vehicles = try await api.chc_fetchVehiclePositions()
+
+                // 2) 스냅샷/필터 (아이콘 품질/중복 제거)
+                let snap = makeRouteSnapshot()
+                let filtered = self.mergeAndFilter(vehicles, snap: snap)
+
+                // 3) 상태 머지 & follow 유령 유지
+                var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
+                for b in filtered {
+                    self.routeNoById[b.id] = b.routeNo
+                    mergedById[b.id] = b
+                }
+                self.ensureFollowGhost(&mergedById)
+
+                applyIfCurrent(epoch: epoch) {
+                    self.buses = Array(mergedById.values)
+                }
+                // 4) 팔로우 대상 재획득
+                if let fid = followBusId,
+                   self.buses.first(where: { $0.id == fid }) == nil,
+                   let rno = routeNoById[fid] {
+
+                    let cand = self.buses
+                        .filter { $0.routeNo == rno }
+                        .min { lhs, rhs in
+                            let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
+                            let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
+                            let last = tracks[fid]?.lastLoc
+                            guard let last else { return false }
+                            let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
+                            return la.distance(from: a) < la.distance(from: b)
+                        }
+                    if let c = cand { followBusId = c.id }
+                }
+            } catch {
+                // 조용히 실패 (네 기존 스타일 유지)
+            }
+            return
+
+        // 🇳🇿 Wellington — 기존 전 차량 일괄 + 스냅/머지
+        case .wellington:
             do {
                 let vehicles = try await api.wl_fetchVehiclePositions()
                 var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
@@ -4375,7 +4495,7 @@ final class MapVM: ObservableObject {
                 self.ensureFollowGhost(&mergedById)
                 applyIfCurrent(epoch: epoch) { self.buses = Array(mergedById.values) }
 
-                // 팔로우 대상 재획득 (기존 로직 재사용)
+                // 팔로우 대상 재획득
                 if let fid = followBusId,
                    self.buses.first(where: { $0.id == fid }) == nil,
                    let rno = routeNoById[fid] {
@@ -4396,52 +4516,53 @@ final class MapVM: ObservableObject {
                 // 무음
             }
             return
-        }
 
-        // === 이하 기존(.motie/.daejeon/.auckland) 경로 ===
-        guard !top.isEmpty else { return }
+        // 🇰🇷/🇳🇿 Auckland 등 기존 경로
+        default:
+            // 상위 ETA 비었으면 갱신 건너뜀
+            guard !top.isEmpty else { return }
 
-        let snap = makeRouteSnapshot()
-        let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
-        var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
+            let snap = makeRouteSnapshot()
+            let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
+            var mergedById: [String: BusLive] = Dictionary(uniqueKeysWithValues: self.buses.map { ($0.id, $0) })
 
-        do {
-            try await withThrowingTaskGroup(of: [BusLive].self) { group in
-                for a in top {
-                    group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) }
-                }
-                while let arr = try await group.next() {
-                    let enriched = arr.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
-                    let filtered = self.mergeAndFilter(enriched, snap: snap)
-                    for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
-                    self.ensureFollowGhost(&mergedById)
-                    applyIfCurrent(epoch: epoch) {
-                        self.buses = Array(mergedById.values)
+            do {
+                try await withThrowingTaskGroup(of: [BusLive].self) { group in
+                    for a in top {
+                        group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) }
+                    }
+                    while let arr = try await group.next() {
+                        let enriched = arr.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
+                        let filtered = self.mergeAndFilter(enriched, snap: snap)
+                        for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
+                        self.ensureFollowGhost(&mergedById)
+                        applyIfCurrent(epoch: epoch) { self.buses = Array(mergedById.values) }
                     }
                 }
+            } catch {
+                // 무음
             }
-        } catch { /* 무음 */ }
 
-        // 팔로우 대상 재획득(기존)
-        if let fid = followBusId,
-           self.buses.first(where: { $0.id == fid }) == nil,
-           let rno = routeNoById[fid] {
+            // 팔로우 대상 재획득
+            if let fid = followBusId,
+               self.buses.first(where: { $0.id == fid }) == nil,
+               let rno = routeNoById[fid] {
 
-            let cand = self.buses
-                .filter { $0.routeNo == rno }
-                .min { lhs, rhs in
-                    let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
-                    let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
-                    let last = tracks[fid]?.lastLoc
-                    guard let last else { return false }
-                    let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
-                    return la.distance(from: a) < la.distance(from: b)
-                }
-
-            if let c = cand { followBusId = c.id }
+                let cand = self.buses
+                    .filter { $0.routeNo == rno }
+                    .min { lhs, rhs in
+                        let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
+                        let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
+                        let last = tracks[fid]?.lastLoc
+                        guard let last else { return false }
+                        let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
+                        return la.distance(from: a) < la.distance(from: b)
+                    }
+                if let c = cand { followBusId = c.id }
+            }
+            return
         }
     }
-
 
     
     
@@ -5875,7 +5996,7 @@ struct BusMapScreen: View {
 /// 배열 또는 단일 객체를 모두 수용
 struct OneOrMany<Element: Decodable>: Decodable {
     let array: [Element]
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         let c = try decoder.singleValueContainer()
         if let one = try? c.decode(Element.self) { array = [one] }
         else { array = try c.decode([Element].self) }
@@ -5892,7 +6013,7 @@ struct ItemsFlex<Item: Decodable>: Decodable {
         let item: OneOrMany<T>?
     }
 
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         // 1) 단일값 컨테이너: null 또는 "" → 빈 배열
         if let sv = try? decoder.singleValueContainer() {
             if sv.decodeNil() || (try? sv.decode(String.self)) != nil {
@@ -6501,7 +6622,7 @@ enum ATAuth {
 private struct ATEnvelope<E: Decodable>: Decodable {
     let entity: [E]
 
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         // 1) { "response": { "entity": [...] } }
         if let top = try? decoder.container(keyedBy: DynamicKey.self),
            top.contains(DynamicKey("response")) {
@@ -6540,7 +6661,7 @@ struct JSONAPIList<T: Decodable>: Decodable {
 
     private enum CodingKeys: String, CodingKey { case data, stops, features }
 
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         // 1) 정상 JSON:API { "data": [ {id, attributes} ] }
         if let c = try? decoder.container(keyedBy: CodingKeys.self),
            c.contains(.data),
@@ -6611,7 +6732,7 @@ extension BusStop: Decodable {
         case cityCode
     }
 
-    public init(from decoder: Decoder) throws {
+    public init(from decoder: Swift.Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let id   = try c.decode(String.self, forKey: .id)
         let name = try c.decode(String.self, forKey: .name)
