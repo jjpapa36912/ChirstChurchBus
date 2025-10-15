@@ -2165,7 +2165,13 @@ final class BusAnnotation: NSObject, MKAnnotation {
         func setOnMap(_ v: Bool) { isOnMap = v }    // ✅ MapKit KVO용: dynamic만, will/didChange 직접 호출 금지
     @objc dynamic var coordinate: CLLocationCoordinate2D
 //    var title: String? { routeNo }
-
+    private struct Pending {
+           var coord: CLLocationCoordinate2D
+           var title: String?
+           var subtitle: String?
+       }
+    private var pending: Pending?
+       private var flushToken: UUID?
     // subtitle은 수동 KVO(다음 런루프)로 유지해도 OK (MapKit이 직접 관찰 안함)
     @objc dynamic private var subtitleStorage: String?
 //    var subtitle: String? { subtitleStorage }
@@ -2213,24 +2219,55 @@ final class BusAnnotation: NSObject, MKAnnotation {
        private var pendingLive: BusLive?
        private var applyScheduled = false
     
-    // ⬇️ 여기 교체
-    // 좌표/라벨만 업데이트 (KVO 충돌 방지용)
-        func applyModelOnly(_ newLive: BusLive) {
-            // 제거 중/맵에서 내려간 상태면 갱신 금지
-            if isZombie || !isOnMap { return }
-            // 반드시 메인 + 트랜잭션 1회
-            if !Thread.isMainThread {
-                DispatchQueue.main.async { [weak self] in self?.applyModelOnly(newLive) }
-                return
+    /// 외부에서 계속 호출: 여기서는 '대기열에만 저장'하고 Flusher에 등록
+      func applyModelOnly(_ newLive: BusLive) {
+          if isZombie || !isOnMap { return }
+          pending = .init(
+              coord: .init(latitude: newLive.lat, longitude: newLive.lon),
+              title: newLive.routeNo,
+              subtitle: Self.makeSubtitle(eta: newLive.etaMinutes, next: newLive.nextStopName)
+          )
+          // 좌표 KVO는 AnnotationFlusher가 한 프레임에 한 번만 발생시키도록 위임
+          AnnotationFlusher.shared.enqueue(self)
+      }
+
+      /// Flusher에서만 호출: 실제 coordinate/title/subtitle KVO를 ‘한 번에’ 발생
+      func flushPendingIfAny() {
+          guard let p = pending, !isZombie, isOnMap else { pending = nil; return }
+          pending = nil
+          if !Thread.isMainThread {
+              DispatchQueue.main.async { [weak self] in self?.flushPendingIfAny() }
+              return
+          }
+          CATransaction.begin()
+          CATransaction.setDisableActions(true)
+          self.coordinate = p.coord
+          // 텍스트는 필수일 때만 변경(변경 없으면 KVO 최소화)
+          if title != p.title { self.title = p.title }
+          if subtitle != p.subtitle { self.subtitle = p.subtitle }
+          CATransaction.commit()
+      }
+        /// 중복 스케줄 방지 + 게이트 열릴 때까지 재시도
+        private func scheduleFlush() {
+            if flushToken != nil { return }
+            let token = UUID()
+            flushToken = token
+
+            func tryFire() {
+                guard self.flushToken == token else { return } // 다른 요청이 대체함
+                if AnnotationGate.shared.paused {
+                    // 상호작용/배치 중 → 다음 프레임에 재시도
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { tryFire() }
+                    return
+                }
+                self.flushToken = nil
+                self.flushPendingIfAny()
             }
-            // MapKit 내부 애니메이션/열거와 충돌 줄이기: 암시적 애니메이션 끄고 한 번에 반영
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            self.coordinate = .init(latitude: newLive.lat, longitude: newLive.lon)
-            self.title = newLive.routeNo
-            self.subtitle = Self.makeSubtitle(eta: newLive.etaMinutes, next: newLive.nextStopName)
-            CATransaction.commit()
+
+            // 항상 다음 런루프에서 시도 (현재 MapKit 내부 열거와 분리)
+            DispatchQueue.main.async { tryFire() }
         }
+
     
     // ✅ 전체 업데이트(애니메이션 포함): will/did 없이 coordinate 직접 대입
     @MainActor
@@ -4010,22 +4047,23 @@ final class MapVM: ObservableObject {
     
     // ⬇️ 이 메서드를 통째로 교체
     // MapVM
+    // MapVM
     private func shouldReload(for region: MKCoordinateRegion) -> Bool {
         // 팔로우 중엔 더 민감
-        let threshold: CLLocationDistance = (followBusId == nil) ? 180 : 120
+        let moveThreshold: CLLocationDistance = (followBusId == nil) ? 120 : 80
 
         // 첫 호출
         if lastStopRefreshCenter == nil { return true }
 
-        // 마지막 "정류장/버스" 갱신 중심에서 얼마나 이동했는지
+        // 중심 이동량
         let moved = metersBetween(lastStopRefreshCenter, region.center)
-        if moved >= threshold { return true }
+        if moved >= moveThreshold { return true }
 
-        // 줌 급변은 보조 트리거
+        // 줌 변화율 (기존 20% → 10%로 상향)
         if let prev = lastRegion {
-            let zoomDelta = abs(region.span.latitudeDelta - prev.span.latitudeDelta) /
-                            max(prev.span.latitudeDelta, 0.0001)
-            if zoomDelta >= 0.20 { return true }
+            let delta = abs(region.span.latitudeDelta - prev.span.latitudeDelta) /
+                        max(prev.span.latitudeDelta, 0.0001)
+            if delta >= 0.10 { return true }
         } else {
             return true
         }
@@ -5781,17 +5819,28 @@ struct ClusteredMapView: UIViewRepresentable {
         // 지도가 움직였을 때: 사용자 제스처가 아니더라도, 팔로우 중이면 주기적으로 정류장 재로딩
         // ClusteredMapView.Coord
         // ClusteredMapView.Coord
-        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-            // 기존: 내부 열거 직후 연쇄 호출 경합 완화 (0.30s)
-            deb.call(after: 0.30) {
-                // 지역 변화에 따른 정류장/데이터 갱신 트리거
-                self.parent.vm.onRegionCommitted(mapView.region)
+        // ClusteredMapView.Coord
 
-                // ✅ 새 뷰포트에 들어온 버스들을 즉시 어노테이션으로 "수화"
-                // (updateUIView 갱신을 기다리지 않고 바로 보이게)
-                self.hydrateVisibleBusAnnotations(mapView)
+        // ClusteredMapView.Coord
+        func mapView(_ mapView: MKMapView, regionWillChangeAnimated animated: Bool) {
+            // 지도 내부가 annotation KVO/클러스터링을 열거하기 시작 → 좌표 플러시 잠시 중단
+            AnnotationGate.shared.pause()
+        }
+
+        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+            // 1) 아주 살짝 뒤에 게이트 재개(내부 열거 종료 대기)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+                AnnotationGate.shared.resume(on: mapView)
+            }
+
+            // 2) 정류장/버스 리로드 트리거 (디바운스는 너무 길면 놓치므로 0.18s)
+            deb.call(after: 0.18) { [weak self, weak mapView] in
+                guard let self, let mapView else { return }
+                self.parent.vm.onRegionCommitted(mapView.region)
             }
         }
+
+
 
         
         
@@ -6872,5 +6921,63 @@ extension BusStop: Decodable {
         let city = (try? c.decode(Int.self, forKey: .cityCode)) ?? 0
 
         self.init(id: id, name: name, lat: lat, lon: lon, cityCode: city)
+    }
+}
+// AnnotationGate.swift
+// AnnotationGate.swift
+import MapKit
+
+final class AnnotationGate {
+    static let shared = AnnotationGate(); private init() {}
+
+    private(set) var paused: Bool = false
+    func pause() { paused = true }
+
+    /// 게이트를 열고, 다음 틱에 안전하게 공동 플러시만 ‘스케줄’합니다.
+    func resume(on mapView: MKMapView) {
+        paused = false
+        AnnotationFlusher.shared.arm(on: mapView) // 즉시 플러시하지 말고 다음 프레임에
+    }
+}
+// AnnotationFlusher.swift
+
+/// 모든 BusAnnotation 좌표/텍스트 갱신은 여기서 '한 프레임에 한 번'만 KVO를 발동시킨다.
+final class AnnotationFlusher {
+    static let shared = AnnotationFlusher(); private init() {}
+
+    private let bucket = NSHashTable<AnyObject>.weakObjects()
+    private weak var mapView: MKMapView?
+    private var armed = false
+
+    /// 플러시 대상을 등록 (중복 등록 OK; weak 로 저장)
+    func enqueue(_ ann: BusAnnotation) {
+        bucket.add(ann)
+        arm(on: mapView)
+    }
+
+    /// 다음 런루프/프레임에 플러시를 ‘한 번만’ 실행
+    func arm(on mapView: MKMapView?) {
+        self.mapView = mapView ?? self.mapView
+        guard !armed, !AnnotationGate.shared.paused else { return }
+        armed = true
+        DispatchQueue.main.async { [weak self] in self?.tick() }
+    }
+
+    private func tick() {
+        armed = false
+        guard !AnnotationGate.shared.paused else { return }
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.tick() }
+            return
+        }
+
+        // 스냅샷 (열거 중 변경 충돌 방지)
+        let anns = bucket.allObjects.compactMap { $0 as? BusAnnotation }
+        bucket.removeAllObjects()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        anns.forEach { $0.flushPendingIfAny() }
+        CATransaction.commit()
     }
 }
